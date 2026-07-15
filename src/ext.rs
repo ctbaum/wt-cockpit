@@ -4,6 +4,7 @@
 //! cockpits.
 
 use serde_json::Value;
+use crate::sessions::{Agent as SessionAgent, Session};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -270,6 +271,31 @@ fn agent_command(id: &str, on: bool) -> String {
     }
 }
 
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\"'\"'"))
+}
+
+fn session_command(session: &Session) -> String {
+    match session.agent {
+        SessionAgent::Claude => String::new(), // spawned inside nvim via NIC_CLAUDE_ARGS
+        SessionAgent::Codex => format!(
+            "{} resume {}",
+            agent_command("codex", true),
+            shell_quote(&session.id)
+        ),
+        SessionAgent::Cursor if session.native_picker => "cursor-agent ls".into(),
+        SessionAgent::Cursor => format!(
+            "{} --resume {}",
+            agent_command("cursor", true),
+            shell_quote(&session.id)
+        ),
+        SessionAgent::Pi => match &session.file {
+            Some(path) => format!("pi --session {}", shell_quote(&path.to_string_lossy())),
+            None => format!("pi --session {}", shell_quote(&session.id)),
+        },
+    }
+}
+
 /// Supported agent ids from `herdr integration status` (line format
 /// "claude: current (v7) (/path)"), falling back to the AGENTS table.
 fn supported_agent_ids() -> Vec<String> {
@@ -326,6 +352,34 @@ pub fn launch_cockpit(
     branch: &str,
     dangerous: bool,
 ) -> Result<(), String> {
+    launch_cockpit_inner(dir, agent, branch, dangerous, None)
+}
+
+/// Recreate the normal nic cockpit at a saved session's original cwd, with
+/// the agent pane (or Claude-in-nvim provider) resuming that conversation.
+pub fn launch_session_cockpit(session: &Session) -> Result<(), String> {
+    if !session.cwd.is_dir() {
+        return Err(format!(
+            "session directory no longer exists: {}",
+            collapse_tilde(&session.cwd.to_string_lossy())
+        ));
+    }
+    launch_cockpit_inner(
+        &session.cwd,
+        Some(session.agent.id()),
+        "",
+        true,
+        Some(session),
+    )
+}
+
+fn launch_cockpit_inner(
+    dir: &Path,
+    agent: Option<&str>,
+    branch: &str,
+    dangerous: bool,
+    resume: Option<&Session>,
+) -> Result<(), String> {
     let mut target = dir.to_path_buf();
 
     // Resolve / create the worktree via wt — wt stays the worktree owner.
@@ -379,11 +433,21 @@ pub fn launch_cockpit(
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| target_str.clone());
-    let label = match (project.is_empty(), br.is_empty()) {
+    let mut label = match (project.is_empty(), br.is_empty()) {
         (false, false) => format!("{project}/{br}"),
         (false, true) => project,
         (true, _) => basename,
     };
+    // A resumed conversation gets its own cockpit instead of accidentally
+    // focusing a live generic project cockpit that does not contain it.
+    if let Some(session) = resume {
+        let tag = if session.native_picker {
+            "sessions".to_string()
+        } else {
+            session.id.chars().take(8).collect()
+        };
+        label = format!("{label}/{}-{tag}", session.agent.id());
+    }
 
     // A cockpit for this label already exists: focus it instead of rebuilding.
     if let Some(existing) = ws_id_for_label(&label) {
@@ -396,16 +460,15 @@ pub fn launch_cockpit(
     // ponytail: claude riding inside nvim (via the claudecode herdr provider
     // reading NIC_AI) is the one setup-specific assumption left — make it a
     // config knob if anyone else wants a different in-editor agent
+    let claude_args = resume
+        .filter(|s| s.agent == SessionAgent::Claude)
+        .map(|s| format!("NIC_CLAUDE_ARGS=--dangerously-skip-permissions --resume {}", s.id))
+        .unwrap_or_else(|| "NIC_CLAUDE_ARGS=--dangerously-skip-permissions".into());
     let mut create: Vec<&str> = vec![
         "herdr", "workspace", "create", "--cwd", &target_str, "--label", &label, "--no-focus",
     ];
     if agent == Some("claude") {
-        create.extend([
-            "--env",
-            "NIC_AI=claude",
-            "--env",
-            "NIC_CLAUDE_ARGS=--dangerously-skip-permissions",
-        ]);
+        create.extend(["--env", "NIC_AI=claude", "--env", &claude_args]);
     }
     let created = json(&create).ok_or("herdr workspace create failed")?;
     let root_pane = &created["result"]["root_pane"];
@@ -430,7 +493,9 @@ pub fn launch_cockpit(
         // Every other agent gets its own pane on the top-right. Dangerous is
         // agent-specific (AGENTS table): append a flag, or prefix an env.
         Some(a) => {
-            let cmd = agent_command(a, dangerous);
+            let cmd = resume
+                .map(session_command)
+                .unwrap_or_else(|| agent_command(a, dangerous));
             let split = json(&[
                 "herdr", "pane", "split", root, "--direction", "right", "--ratio", "0.7",
                 "--cwd", &target_str, "--no-focus",
@@ -475,5 +540,29 @@ mod tests {
         assert!(!dangerous_toggleable("claude"));
         assert!(dangerous_toggleable("codex"));
         assert!(dangerous_toggleable("opencode"));
+    }
+
+    #[test]
+    fn builds_safe_session_resume_commands() {
+        let mut session = Session {
+            agent: SessionAgent::Codex,
+            id: "abc-123".into(),
+            cwd: PathBuf::from("/tmp/project"),
+            title: "test".into(),
+            updated: 0,
+            file: None,
+            native_picker: false,
+        };
+        assert_eq!(
+            session_command(&session),
+            "codex --dangerously-bypass-approvals-and-sandbox resume 'abc-123'"
+        );
+
+        session.agent = SessionAgent::Pi;
+        session.file = Some(PathBuf::from("/tmp/project's session.jsonl"));
+        assert_eq!(
+            session_command(&session),
+            "pi --session '/tmp/project'\"'\"'s session.jsonl'"
+        );
     }
 }

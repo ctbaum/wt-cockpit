@@ -86,7 +86,6 @@ pub struct App {
     pub session_agent: Option<SessionAgent>,
     pub status: Option<String>,
     pub quit: bool,
-    pub resume: Option<Session>,
     // Previews run subprocesses (herdr/wt/eza) on a worker thread so a slow
     // or hung command can never freeze the UI; results drain each tick.
     preview_tx: mpsc::Sender<(String, Entry, u16, u16)>,
@@ -141,7 +140,6 @@ impl App {
             session_agent: None,
             status: None,
             quit: false,
-            resume: None,
             preview_tx,
             preview_rx,
             requested: HashSet::new(),
@@ -322,8 +320,11 @@ impl App {
                 });
             }
             EntryKind::Session(session) => {
-                self.resume = Some(session.clone());
-                self.quit = true;
+                let session = session.clone();
+                match ext::launch_session_cockpit(&session) {
+                    Ok(()) => self.quit = true,
+                    Err(e) => self.status = Some(e),
+                }
             }
         }
     }

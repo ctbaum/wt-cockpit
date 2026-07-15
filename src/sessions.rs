@@ -5,9 +5,7 @@
 use serde_json::Value;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -261,43 +259,6 @@ pub fn age(updated: u64) -> String {
         3600..=86_399 => format!("{}h ago", seconds / 3600),
         _ => format!("{}d ago", seconds / 86_400),
     }
-}
-
-/// Replace the picker process with the selected agent. Herdr keeps the
-/// temporary pane alive for the resumed session and closes it when the agent
-/// eventually exits.
-pub fn resume(session: Session) -> std::io::Error {
-    let mut command = match session.agent {
-        Agent::Claude => {
-            let mut c = Command::new("claude");
-            c.args(["--resume", &session.id]);
-            c
-        }
-        Agent::Codex => {
-            let mut c = Command::new("codex");
-            c.args(["resume", &session.id]);
-            c
-        }
-        Agent::Cursor => {
-            let mut c = Command::new("cursor-agent");
-            if session.native_picker {
-                c.arg("ls");
-            } else {
-                c.args(["--resume", &session.id]);
-            }
-            c
-        }
-        Agent::Pi => {
-            let mut c = Command::new("pi");
-            if let Some(path) = &session.file {
-                c.arg("--session").arg(path);
-            } else {
-                c.args(["--session", &session.id]);
-            }
-            c
-        }
-    };
-    command.current_dir(&session.cwd).exec()
 }
 
 #[cfg(test)]

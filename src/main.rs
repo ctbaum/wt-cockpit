@@ -49,8 +49,5 @@ fn main() -> std::io::Result<()> {
     }
     let _ = execute!(std::io::stdout(), DisableFocusChange);
     ratatui::restore();
-    if let Some(session) = app.resume.take() {
-        return Err(sessions::resume(session));
-    }
     Ok(())
 }

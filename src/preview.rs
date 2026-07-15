@@ -24,7 +24,7 @@ fn session(s: &crate::sessions::Session) -> Text<'static> {
     let action = if s.native_picker {
         "opens Cursor's native session picker"
     } else {
-        "resumes this session in the picker pane"
+        "recreates its project cockpit and resumes there"
     };
     Text::from(vec![
         Line::from(vec!["agent    ".dim(), s.agent.id().to_string().bold()]),
