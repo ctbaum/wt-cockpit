@@ -107,6 +107,34 @@ struct PaneRect {
     y: i64,
     w: i64,
     h: i64,
+    focused: bool,
+}
+
+/// Remove the temporary picker pane from a self-preview and restore the pane
+/// that was split to make room for it. Herdr split siblings share one complete
+/// axis and touch on the other, which is enough to reconstruct their union.
+fn remove_own_and_grow_sibling(panes: &mut Vec<PaneRect>, own_pane: &str) {
+    let Some(index) = panes.iter().position(|pane| pane.id == own_pane) else {
+        return;
+    };
+    let own = panes.remove(index);
+    let sibling = panes.iter_mut().find(|pane| {
+        let beside = pane.y == own.y
+            && pane.h == own.h
+            && (pane.x + pane.w == own.x || own.x + own.w == pane.x);
+        let stacked = pane.x == own.x
+            && pane.w == own.w
+            && (pane.y + pane.h == own.y || own.y + own.h == pane.y);
+        beside || stacked
+    });
+    if let Some(sibling) = sibling {
+        let x2 = (sibling.x + sibling.w).max(own.x + own.w);
+        let y2 = (sibling.y + sibling.h).max(own.y + own.h);
+        sibling.x = sibling.x.min(own.x);
+        sibling.y = sibling.y.min(own.y);
+        sibling.w = x2 - sibling.x;
+        sibling.h = y2 - sibling.y;
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -114,6 +142,17 @@ struct Cell {
     ch: char,
     style: Style,
 }
+
+#[derive(Clone, Copy, Default)]
+struct BorderCell {
+    links: u8,
+    focused: bool,
+}
+
+const UP: u8 = 1;
+const DOWN: u8 = 2;
+const LEFT: u8 = 4;
+const RIGHT: u8 = 8;
 
 fn ansi_color(n: u16, bright: bool) -> Option<Color> {
     Some(match (n, bright) {
@@ -236,6 +275,136 @@ fn ansi_lines(input: &str) -> Vec<Vec<Cell>> {
     lines
 }
 
+fn non_whitespace(line: &[Cell]) -> usize {
+    line.iter().filter(|cell| !cell.ch.is_whitespace()).count()
+}
+
+/// Crop a pane into its thumbnail interior without resampling terminal cells.
+///
+/// Text-mode glyphs cannot be downscaled without distortion. For Neovim-like
+/// screens (a dense final statusline), center the body crop on its visual mass
+/// and pin the matching statusline slice at the bottom. Other panes are
+/// bottom-aligned so recent shell/agent output remains visible.
+fn blit_fidelity(
+    canvas: &mut [Vec<Cell>],
+    content: &[Vec<Cell>],
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+) {
+    if content.is_empty() || w == 0 || h == 0 {
+        return;
+    }
+    let src_h = content.len();
+    let src_w = content.iter().map(Vec::len).max().unwrap_or(0);
+    if src_w == 0 {
+        return;
+    }
+
+    let last_count = non_whitespace(&content[src_h - 1]);
+    let last_background = content[src_h - 1]
+        .iter()
+        .filter(|cell| cell.style.bg.is_some())
+        .count();
+    let has_statusline = src_h > 1 && last_count * 4 >= src_w && last_background * 2 >= src_w;
+    let body_end = src_h - usize::from(has_statusline);
+    let body_slots = h - usize::from(has_statusline);
+    if body_slots == 0 || body_end == 0 {
+        return;
+    }
+
+    let body_start = if has_statusline {
+        let (weighted_rows, weight): (usize, usize) = content[..body_end]
+            .iter()
+            .enumerate()
+            .map(|(row, line)| {
+                let count = non_whitespace(line);
+                (row * count, count)
+            })
+            .fold((0, 0), |(row_sum, count_sum), (row, count)| {
+                (row_sum + row, count_sum + count)
+            });
+        let anchor = weighted_rows.checked_div(weight).unwrap_or(body_end / 2);
+        anchor
+            .saturating_sub(body_slots.saturating_sub(1) / 2)
+            .min(body_end.saturating_sub(body_slots))
+    } else {
+        body_end.saturating_sub(body_slots)
+    };
+    let visible_rows = body_slots.min(body_end - body_start);
+
+    let densest = content[body_start..body_start + visible_rows]
+        .iter()
+        .max_by_key(|line| non_whitespace(line));
+    let horizontal_anchor = densest
+        .and_then(|line| {
+            let left = line.iter().position(|cell| !cell.ch.is_whitespace())?;
+            let right = line.iter().rposition(|cell| !cell.ch.is_whitespace())?;
+            Some((left + right) / 2)
+        })
+        .unwrap_or(src_w / 2);
+    let source_x = horizontal_anchor
+        .saturating_sub(w.saturating_sub(1) / 2)
+        .min(src_w.saturating_sub(w));
+    let destination_x = x + w.saturating_sub(src_w) / 2;
+
+    let copy_row = |canvas: &mut [Vec<Cell>], source: &[Cell], dy: usize, sx: usize| {
+        for (dx, cell) in source.iter().skip(sx).take(w).enumerate() {
+            if let Some(row) = canvas.get_mut(y + dy)
+                && let Some(dst) = row.get_mut(destination_x + dx)
+            {
+                *dst = *cell;
+            }
+        }
+    };
+    for dy in 0..visible_rows {
+        copy_row(canvas, &content[body_start + dy], dy, source_x);
+    }
+    if has_statusline {
+        copy_row(canvas, &content[src_h - 1], h - 1, source_x);
+    }
+}
+
+fn connect_horizontal(borders: &mut [Vec<BorderCell>], x: usize, y: usize, focused: bool) {
+    if y >= borders.len() || x + 1 >= borders[y].len() {
+        return;
+    }
+    borders[y][x].links |= RIGHT;
+    borders[y][x + 1].links |= LEFT;
+    borders[y][x].focused |= focused;
+    borders[y][x + 1].focused |= focused;
+}
+
+fn connect_vertical(borders: &mut [Vec<BorderCell>], x: usize, y: usize, focused: bool) {
+    if y + 1 >= borders.len() || x >= borders[y].len() || x >= borders[y + 1].len() {
+        return;
+    }
+    borders[y][x].links |= DOWN;
+    borders[y + 1][x].links |= UP;
+    borders[y][x].focused |= focused;
+    borders[y + 1][x].focused |= focused;
+}
+
+fn border_char(links: u8) -> char {
+    match links {
+        12 => '─', // left + right
+        3 => '│',  // up + down
+        10 => '┌', // down + right
+        6 => '┐',  // down + left
+        9 => '└',  // up + right
+        5 => '┘',  // up + left
+        11 => '├', // up + down + right
+        7 => '┤',  // up + down + left
+        14 => '┬', // down + left + right
+        13 => '┴', // up + left + right
+        15 => '┼',
+        1 | 2 => '│',
+        4 | 8 => '─',
+        _ => ' ',
+    }
+}
+
 fn thumbnail(ws: &str, pw: usize, ph: usize, own_pane: &str) -> Text<'static> {
     let (pw, ph) = (pw.max(24), ph.max(8));
     let Some(pl) = ext::json(&["herdr", "pane", "list", "--workspace", ws]) else {
@@ -259,14 +428,14 @@ fn thumbnail(ws: &str, pw: usize, ph: usize, own_pane: &str) -> Text<'static> {
                         y: p["rect"]["y"].as_i64().unwrap_or(0),
                         w: p["rect"]["width"].as_i64().unwrap_or(0),
                         h: p["rect"]["height"].as_i64().unwrap_or(0),
+                        focused: p["focused"].as_bool().unwrap_or(false),
                     })
                     .collect()
             })
         })
         .unwrap_or_default();
-    // ponytail: dropping our own pane leaves a blank gap in the thumbnail;
-    // sibling-grow reflow can close this gap later if it becomes distracting
-    panes.retain(|p| p.id != own_pane && !p.id.is_empty());
+    panes.retain(|pane| !pane.id.is_empty());
+    remove_own_and_grow_sibling(&mut panes, own_pane);
     if panes.is_empty() {
         return Text::raw("(only this pane)");
     }
@@ -302,50 +471,47 @@ fn thumbnail(ws: &str, pw: usize, ph: usize, own_pane: &str) -> Text<'static> {
         ];
         ph
     ];
+    let mut borders = vec![vec![BorderCell::default(); pw]; ph];
     for p in &panes {
         let (cx, cx2, cy, cy2) = (xm(p.x), xm(p.x + p.w), ym(p.y), ym(p.y + p.h));
-        let (cw, ch) = (cx2.saturating_sub(cx), cy2.saturating_sub(cy));
-        if cw == 0 || ch == 0 {
+        // Rect endpoints are pane boundaries, so adjacent panes must use the
+        // same scaled coordinate. This gives shared edges one column/row and
+        // lets the connection grid form real T and cross junctions.
+        let (left, right) = (cx.min(pw - 1), cx2.min(pw - 1));
+        let (top, bottom) = (cy.min(ph - 1), cy2.min(ph - 1));
+        if right <= left || bottom <= top {
             continue;
         }
-        let mut content: &[Vec<Cell>] = &texts[&p.id];
-        while content
-            .last()
-            .is_some_and(|l| l.iter().all(|c| c.ch.is_whitespace()))
-        {
-            content = &content[..content.len() - 1];
+
+        for x in left..right {
+            connect_horizontal(&mut borders, x, top, p.focused);
+            connect_horizontal(&mut borders, x, bottom, p.focused);
         }
-        for (ri, ln) in content.iter().take(ch).enumerate() {
-            if cy + ri >= ph {
-                break;
-            }
-            for (ci, cell) in ln.iter().take(cw).enumerate() {
-                if cx + ci < pw {
-                    canvas[cy + ri][cx + ci] = *cell;
-                }
-            }
+        for y in top..bottom {
+            connect_vertical(&mut borders, left, y, p.focused);
+            connect_vertical(&mut borders, right, y, p.focused);
         }
+
+        blit_fidelity(
+            &mut canvas,
+            &texts[&p.id],
+            left + 1,
+            top + 1,
+            right.saturating_sub(left + 1),
+            bottom.saturating_sub(top + 1),
+        );
     }
-    // Dim separators at internal edges.
-    for p in &panes {
-        let (cx, cx2, cy, cy2) = (xm(p.x), xm(p.x + p.w), ym(p.y), ym(p.y + p.h));
-        if cx > 0 && cx < pw {
-            for row in canvas.iter_mut().take(cy2.min(ph)).skip(cy) {
-                row[cx] = Cell {
-                    ch: '│',
-                    style: Style::new().dark_gray(),
+    for (y, row) in borders.iter().enumerate() {
+        for (x, border) in row.iter().enumerate() {
+            if border.links != 0 {
+                canvas[y][x] = Cell {
+                    ch: border_char(border.links),
+                    style: if border.focused {
+                        Style::new().yellow()
+                    } else {
+                        Style::new().dark_gray()
+                    },
                 };
-            }
-        }
-        if cy > 0 && cy < ph {
-            for cell in canvas[cy].iter_mut().take(cx2.min(pw)).skip(cx) {
-                *cell = Cell {
-                    ch: '─',
-                    style: Style::new().dark_gray(),
-                };
-            }
-            if cx > 0 && cx < pw {
-                canvas[cy][cx].ch = '┼';
             }
         }
     }
@@ -396,5 +562,63 @@ mod tests {
         assert!(lines[0][0].style.add_modifier.contains(Modifier::BOLD));
         assert_eq!(lines[0][0].style.fg, Some(Color::Red));
         assert_eq!(lines[0][1].style, Style::default());
+    }
+
+    #[test]
+    fn crops_cells_verbatim_and_pins_a_statusline() {
+        let background = Style::default().bg(Color::Black);
+        let content: Vec<Vec<Cell>> = ["      ", " ABCD ", " EFGH ", "      ", "STATUS"]
+            .into_iter()
+            .enumerate()
+            .map(|(row, line)| {
+                line.chars()
+                    .map(|ch| Cell {
+                        ch,
+                        style: if row == 4 {
+                            background
+                        } else {
+                            Style::default()
+                        },
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut canvas = vec![vec![Cell::default(); 4]; 3];
+        blit_fidelity(&mut canvas, &content, 0, 0, 4, 3);
+
+        assert_eq!(canvas[0].iter().map(|c| c.ch).collect::<String>(), "ABCD");
+        assert_eq!(canvas[1].iter().map(|c| c.ch).collect::<String>(), "EFGH");
+        assert_eq!(canvas[2].iter().map(|c| c.ch).collect::<String>(), "TATU");
+        assert_eq!(canvas[2][0].style.bg, Some(Color::Black));
+    }
+
+    #[test]
+    fn self_preview_removes_picker_and_regrows_its_sibling() {
+        let pane = |id: &str, x, y, w, h| PaneRect {
+            id: id.to_string(),
+            x,
+            y,
+            w,
+            h,
+            focused: false,
+        };
+        let mut panes = vec![
+            pane("nvim", 0, 0, 70, 60),
+            pane("picker", 70, 0, 30, 60),
+            pane("terminal", 0, 60, 100, 20),
+        ];
+
+        remove_own_and_grow_sibling(&mut panes, "picker");
+
+        assert_eq!(panes.len(), 2);
+        let nvim = panes.iter().find(|pane| pane.id == "nvim").unwrap();
+        assert_eq!((nvim.x, nvim.y, nvim.w, nvim.h), (0, 0, 100, 60));
+    }
+
+    #[test]
+    fn renders_merged_pane_border_junctions() {
+        assert_eq!(border_char(DOWN | RIGHT), '┌');
+        assert_eq!(border_char(UP | DOWN | RIGHT), '├');
+        assert_eq!(border_char(UP | DOWN | LEFT | RIGHT), '┼');
     }
 }

@@ -440,9 +440,32 @@ fn wt_path_for(dir: &Path, branch: &str) -> Option<PathBuf> {
     None
 }
 
+fn project_name_from_worktrees(porcelain: &str) -> Option<String> {
+    let first = porcelain.split("\n\n").next()?;
+    let mut lines = first.lines();
+    let root = lines.next()?.strip_prefix("worktree ")?.trim();
+    let bare = lines.any(|line| line == "bare");
+    let path = Path::new(root);
+    let name = path.file_name()?.to_string_lossy();
+
+    if bare && matches!(name.as_ref(), "bare" | ".bare") {
+        return path
+            .parent()?
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned());
+    }
+    if bare
+        && let Some(name) = name.strip_suffix(".git")
+        && !name.is_empty()
+    {
+        return Some(name.to_string());
+    }
+    Some(name.into_owned())
+}
+
 fn in_git_repo(dir: &Path) -> bool {
     let Some(d) = dir.to_str() else { return false };
-    out(&["git", "-C", d, "rev-parse", "--show-toplevel"]).is_some()
+    out(&["git", "-C", d, "rev-parse", "--git-dir"]).is_some()
 }
 
 /// Build a deck workspace: nvim + agent + full-width terminal + lazygit
@@ -513,15 +536,9 @@ fn launch_deck_inner(
     let mut br = String::new();
     if in_git_repo(&target) {
         if let Some(porcelain) = out(&["git", "-C", &target_str, "worktree", "list", "--porcelain"])
-            && let Some(root) = porcelain
-                .lines()
-                .next()
-                .and_then(|l| l.strip_prefix("worktree "))
+            && let Some(name) = project_name_from_worktrees(&porcelain)
         {
-            project = Path::new(root.trim())
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default();
+            project = name;
         }
         br = if branch.is_empty() {
             out(&["git", "-C", &target_str, "symbolic-ref", "--short", "HEAD"])
@@ -535,6 +552,14 @@ fn launch_deck_inner(
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| target_str.clone());
+    // Keep the cockpit tab anchored to the project rather than the deck
+    // implementation. For linked worktrees this is the main worktree's
+    // basename; plain directories use their own basename.
+    let tab_name = if project.is_empty() {
+        basename.clone()
+    } else {
+        project.clone()
+    };
     let mut label = match (project.is_empty(), br.is_empty()) {
         (false, false) => format!("{project}/{br}"),
         (false, true) => project,
@@ -593,7 +618,7 @@ fn launch_deck_inner(
         .ok_or("no pane_id in create result")?;
     let root_tab = root_pane["tab_id"].as_str().unwrap_or("");
 
-    out(&["herdr", "tab", "rename", root_tab, "deck"]);
+    out(&["herdr", "tab", "rename", root_tab, &tab_name]);
 
     // Full-width terminal on the bottom row.
     out(&[
@@ -668,6 +693,29 @@ fn launch_deck_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_projects_from_normal_and_bare_worktree_roots() {
+        assert_eq!(
+            project_name_from_worktrees(
+                "worktree /src/herdr-deck\nHEAD abc\nbranch refs/heads/main\n"
+            )
+            .as_deref(),
+            Some("herdr-deck")
+        );
+        assert_eq!(
+            project_name_from_worktrees("worktree /src/herdr-deck/.bare\nbare\n").as_deref(),
+            Some("herdr-deck")
+        );
+        assert_eq!(
+            project_name_from_worktrees("worktree /src/herdr-deck/bare\nbare\n").as_deref(),
+            Some("herdr-deck")
+        );
+        assert_eq!(
+            project_name_from_worktrees("worktree /src/herdr-deck.git\nbare\n").as_deref(),
+            Some("herdr-deck")
+        );
+    }
 
     #[test]
     fn dangerous_command_and_toggle() {
