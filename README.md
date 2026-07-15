@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/wt-cockpit-logo.png" alt="wt-cockpit retro-punk logo" width="420">
+  <img src="assets/wt-cockpit-hero.png" alt="wt-cockpit — one picker, your whole cockpit" width="100%">
 </p>
 
 # wt-cockpit
