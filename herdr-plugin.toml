@@ -19,5 +19,5 @@ command = ["bash", "scripts/open-deck.sh"]
 [[panes]]
 id = "picker"
 title = "herdr-deck"
-placement = "split"
+placement = "zoomed"
 command = ["bash", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-deck\""]
