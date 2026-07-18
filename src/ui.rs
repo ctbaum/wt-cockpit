@@ -249,7 +249,7 @@ fn draw_launch(f: &mut Frame, area: Rect, form: &LaunchForm, agents: &[String]) 
         .iter()
         .map(|s| s.content.chars().count())
         .sum::<usize>();
-    let lines = vec![
+    let mut lines = vec![
         Line::from(agent_spans),
         Line::from(vec![
             field_label(" checkout ", form.field == 1),
@@ -259,12 +259,40 @@ fn draw_launch(f: &mut Frame, area: Rect, form: &LaunchForm, agents: &[String]) 
             } else {
                 Span::raw("")
             },
-            if form.branch.is_empty() {
-                " branch · ^ · - · @ · pr:N · mr:N".dim()
-            } else {
-                Span::raw("")
-            },
         ]),
+    ];
+    if form.field == 1 {
+        let matches = form.matching_candidates();
+        if matches.is_empty() {
+            lines.push(Line::from(
+                "   no matching worktrees · type to create".dim(),
+            ));
+        } else {
+            let first_visible = form
+                .candidate_selected
+                .map(|selected| selected.saturating_sub(4))
+                .unwrap_or(0);
+            for (filtered_index, candidate_index) in
+                matches.iter().enumerate().skip(first_visible).take(5)
+            {
+                let candidate = &form.candidates[*candidate_index];
+                let selected = form.candidate_selected == Some(filtered_index);
+                let marker = if selected { " > " } else { "   " };
+                let current = if candidate.current { "  @ current" } else { "" };
+                let row = format!("{marker}{}{current}", candidate.branch);
+                lines.push(if selected {
+                    Line::from(row.light_yellow().bold().bg(Color::Black))
+                } else {
+                    Line::from(row)
+                });
+            }
+            let remaining = matches.len().saturating_sub(first_visible + 5);
+            if remaining > 0 {
+                lines.push(Line::from(format!("   … {remaining} more").dim()));
+            }
+        }
+    }
+    lines.extend([
         Line::from(vec![
             // Greyed out for agents without a known dangerous mode and
             // "none", where the toggle has no effect.
@@ -282,8 +310,8 @@ fn draw_launch(f: &mut Frame, area: Rect, form: &LaunchForm, agents: &[String]) 
         ]),
         Line::raw(""),
         Line::from(" ^ default · - previous · @ current · pr:N GitHub · mr:N GitLab".dim()),
-        Line::from(" ⇥ field · space/←→ toggle · ↵ launch · esc back".dim()),
-    ];
+        Line::from(" ⇥ field · ↑↓ worktree · ↵ choose/launch · esc back".dim()),
+    ]);
     let title = format!(
         " launch: {} ",
         ext::collapse_tilde(&form.dir.to_string_lossy())

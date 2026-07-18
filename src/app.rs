@@ -61,8 +61,66 @@ pub struct LaunchForm {
     pub dir: PathBuf,
     pub agent: usize, // index into App.agents; == agents.len() means "none"
     pub branch: String,
+    pub candidates: Vec<ext::WorktreeCandidate>,
+    /// Index into the filtered candidate list, not `candidates` itself.
+    pub candidate_selected: Option<usize>,
     pub dangerous: bool,
     pub field: usize, // 0 agent, 1 branch, 2 dangerous
+}
+
+impl LaunchForm {
+    fn new(dir: PathBuf, agent: usize) -> Self {
+        let candidates = ext::worktree_candidates(&dir);
+        Self {
+            dir,
+            agent,
+            branch: String::new(),
+            candidates,
+            candidate_selected: None,
+            dangerous: true,
+            field: 0,
+        }
+    }
+
+    pub fn matching_candidates(&self) -> Vec<usize> {
+        self.candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| match_indices(&candidate.branch, self.branch.trim()).is_some())
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    fn move_candidate(&mut self, delta: isize) {
+        let len = self.matching_candidates().len();
+        if len == 0 {
+            self.candidate_selected = None;
+            return;
+        }
+        self.candidate_selected = Some(match (self.candidate_selected, delta.is_negative()) {
+            (Some(0), true) | (None, true) => len - 1,
+            (Some(index), true) => index - 1,
+            (Some(index), false) => (index + 1) % len,
+            (None, false) => 0,
+        });
+    }
+
+    fn accept_candidate(&mut self) -> bool {
+        let Some(selected) = self.candidate_selected else {
+            return false;
+        };
+        let Some(candidate) = self
+            .matching_candidates()
+            .get(selected)
+            .and_then(|index| self.candidates.get(*index))
+        else {
+            self.candidate_selected = None;
+            return false;
+        };
+        self.branch.clone_from(&candidate.branch);
+        self.candidate_selected = None;
+        true
+    }
 }
 
 pub enum DelAction {
@@ -356,13 +414,7 @@ impl App {
                 self.quit = true;
             }
             EntryKind::Worktree(p) | EntryKind::Cleanable { path: p, .. } | EntryKind::Dir(p) => {
-                self.mode = Mode::Launch(LaunchForm {
-                    dir: p.clone(),
-                    agent: self.default_agent(),
-                    branch: String::new(),
-                    dangerous: true,
-                    field: 0,
-                });
+                self.mode = Mode::Launch(LaunchForm::new(p.clone(), self.default_agent()));
             }
             EntryKind::Session(session) => {
                 let session = session.clone();
@@ -546,9 +598,22 @@ impl App {
         };
         match key.code {
             KeyCode::Esc => self.mode = Mode::List,
-            KeyCode::Tab | KeyCode::Down => form.field = (form.field + 1) % 3,
-            KeyCode::BackTab | KeyCode::Up => form.field = (form.field + 2) % 3,
+            KeyCode::Tab => {
+                form.field = (form.field + 1) % 3;
+                form.candidate_selected = None;
+            }
+            KeyCode::BackTab => {
+                form.field = (form.field + 2) % 3;
+                form.candidate_selected = None;
+            }
+            KeyCode::Down if form.field == 1 => form.move_candidate(1),
+            KeyCode::Up if form.field == 1 => form.move_candidate(-1),
+            KeyCode::Down => form.field = (form.field + 1) % 3,
+            KeyCode::Up => form.field = (form.field + 2) % 3,
             KeyCode::Enter => {
+                if form.field == 1 && form.accept_candidate() {
+                    return;
+                }
                 let (dir, idx, branch) = (form.dir.clone(), form.agent, form.branch.clone());
                 let dangerous = form.dangerous;
                 let agent = self.agents.get(idx).cloned();
@@ -574,8 +639,12 @@ impl App {
             }
             KeyCode::Backspace if form.field == 1 => {
                 form.branch.pop();
+                form.candidate_selected = None;
             }
-            KeyCode::Char(c) if form.field == 1 => form.branch.push(c),
+            KeyCode::Char(c) if form.field == 1 => {
+                form.branch.push(c);
+                form.candidate_selected = None;
+            }
             _ => {}
         }
     }
@@ -602,13 +671,8 @@ impl App {
                 }
                 match std::fs::create_dir_all(&p) {
                     Ok(()) => {
-                        self.mode = Mode::Launch(LaunchForm {
-                            dir: PathBuf::from(p),
-                            agent: self.default_agent(),
-                            branch: String::new(),
-                            dangerous: true,
-                            field: 0,
-                        });
+                        self.mode =
+                            Mode::Launch(LaunchForm::new(PathBuf::from(p), self.default_agent()));
                     }
                     Err(e) => {
                         self.status = Some(format!("mkdir failed: {e}"));
@@ -618,5 +682,51 @@ impl App {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn launch_form(branches: &[&str]) -> LaunchForm {
+        LaunchForm {
+            dir: PathBuf::from("/repo"),
+            agent: 0,
+            branch: String::new(),
+            candidates: branches
+                .iter()
+                .map(|branch| ext::WorktreeCandidate {
+                    branch: (*branch).into(),
+                    path: PathBuf::from(format!("/repo.wt/{branch}")),
+                    current: false,
+                })
+                .collect(),
+            candidate_selected: None,
+            dangerous: true,
+            field: 1,
+        }
+    }
+
+    #[test]
+    fn checkout_candidates_filter_and_accept_without_blocking_free_form_input() {
+        let mut form = launch_form(&["main", "feature/picker", "fix-preview"]);
+        form.branch = "pick".into();
+        assert_eq!(form.matching_candidates(), vec![1]);
+        assert!(!form.accept_candidate());
+
+        form.move_candidate(1);
+        assert!(form.accept_candidate());
+        assert_eq!(form.branch, "feature/picker");
+        assert_eq!(form.candidate_selected, None);
+    }
+
+    #[test]
+    fn checkout_candidate_navigation_wraps() {
+        let mut form = launch_form(&["main", "feature/picker"]);
+        form.move_candidate(-1);
+        assert_eq!(form.candidate_selected, Some(1));
+        form.move_candidate(1);
+        assert_eq!(form.candidate_selected, Some(0));
     }
 }

@@ -230,6 +230,44 @@ pub struct IntegratedWt {
     pub clean: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorktreeCandidate {
+    pub branch: String,
+    pub path: PathBuf,
+    pub current: bool,
+}
+
+fn worktree_candidate_rows(value: &Value) -> Vec<WorktreeCandidate> {
+    value
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|row| {
+            Some(WorktreeCandidate {
+                branch: row["branch"]
+                    .as_str()
+                    .filter(|branch| !branch.is_empty())?
+                    .into(),
+                path: PathBuf::from(row["path"].as_str()?),
+                current: row["is_current"].as_bool() == Some(true),
+            })
+        })
+        .collect()
+}
+
+/// Existing worktrees in the repository containing `path`, in Worktrunk's
+/// own display order. An empty result also covers ordinary non-repository
+/// directories, where checkout remains a free-form field.
+pub fn worktree_candidates(path: &Path) -> Vec<WorktreeCandidate> {
+    let Some(path) = path.to_str() else {
+        return Vec::new();
+    };
+    json(&["wt", "-C", path, "list", "--format=json"])
+        .map(|rows| worktree_candidate_rows(&rows))
+        .unwrap_or_default()
+}
+
 #[derive(Default, Debug, PartialEq, Eq)]
 pub struct BatchRemoval {
     pub removed: usize,
@@ -1065,6 +1103,30 @@ mod tests {
                     project: "repo".into(),
                     branch: "dirty-but-landed".into(),
                     clean: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_worktree_candidates_in_worktrunk_order() {
+        let rows = serde_json::json!([
+            { "branch": "main", "path": "/repo", "is_current": true },
+            { "branch": "feature/picker", "path": "/repo.wt/picker", "is_current": false },
+            { "branch": "", "path": "/repo.wt/detached", "is_current": false }
+        ]);
+        assert_eq!(
+            worktree_candidate_rows(&rows),
+            vec![
+                WorktreeCandidate {
+                    branch: "main".into(),
+                    path: PathBuf::from("/repo"),
+                    current: true,
+                },
+                WorktreeCandidate {
+                    branch: "feature/picker".into(),
+                    path: PathBuf::from("/repo.wt/picker"),
+                    current: false,
                 },
             ]
         );

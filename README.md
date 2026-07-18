@@ -47,7 +47,8 @@ runtime, one small binary.
   session alone. Running it inside a pane would nest Herdr in Herdr.
 - **Open**: Enter on a live workspace focuses it. Enter on a worktree or
   directory opens a launch form: pick an agent (found on your `PATH` from
-  Herdr's known-agent list), optionally enter a branch or Worktrunk
+  Herdr's known-agent list), choose an existing repository worktree from the
+  checkout suggestions, or enter a new branch or Worktrunk
   shortcut (`^`, `-`, `@`, `pr:N`, `mr:N`, or a PR/MR URL), and go.
   Worktrunk creates or resolves the checkout, runs its lifecycle hooks, and
   returns its path to herdr-deck. The resulting deck is an editor + agent pane
