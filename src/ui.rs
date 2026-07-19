@@ -272,7 +272,9 @@ fn draw_launch(f: &mut Frame, area: Rect, form: &LaunchForm, agents: &[String]) 
     ]));
     if form.field == 1 {
         let matches = form.matching_candidates();
-        if matches.is_empty() {
+        if form.candidates_loading {
+            lines.push(Line::from("   loading worktrees…".dim()));
+        } else if matches.is_empty() {
             lines.push(Line::from("   no matching worktrees".dim()));
         } else {
             let first_visible = form

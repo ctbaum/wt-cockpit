@@ -1326,11 +1326,11 @@ mod tests {
         std::fs::create_dir_all(&plain).unwrap();
 
         let organized = organize_dirs(vec![
-            plain.clone(),   // frecency-first, but plain sorts after git
-            a_wt.clone(),    // project A appears first via a worktree
-            b.clone(),       // project B must not interleave into A
+            plain.clone(),    // frecency-first, but plain sorts after git
+            a_wt.clone(),     // project A appears first via a worktree
+            b.clone(),        // project B must not interleave into A
             a.join("server"), // inside a checkout: dropped
-            a.clone(),       // root still leads its group
+            a.clone(),        // root still leads its group
         ]);
         assert_eq!(
             organized,

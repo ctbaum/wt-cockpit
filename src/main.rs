@@ -42,6 +42,7 @@ fn main() -> std::io::Result<()> {
     let _ = execute!(std::io::stdout(), EnableFocusChange);
     loop {
         app.drain_previews();
+        app.drain_candidates();
         terminal.draw(|f| ui::draw(f, &mut app))?;
         // Blocking work (worktrunk hooks, session scans, removals) runs here,
         // right after a draw, so its status message is on screen throughout.

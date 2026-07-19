@@ -62,6 +62,9 @@ pub struct LaunchForm {
     pub agent: usize, // index into App.agents; == agents.len() means "none"
     pub branch: String,
     pub candidates: Vec<ext::WorktreeCandidate>,
+    /// Candidates load on a worker thread (`wt list` can take minutes on a
+    /// pathological repo); the form opens immediately and fills in later.
+    pub candidates_loading: bool,
     /// Index into the filtered candidate list, not `candidates` itself.
     pub candidate_selected: Option<usize>,
     pub dangerous: bool,
@@ -70,12 +73,12 @@ pub struct LaunchForm {
 
 impl LaunchForm {
     fn new(dir: PathBuf, agent: usize) -> Self {
-        let candidates = ext::worktree_candidates(&dir);
         Self {
             dir,
             agent,
             branch: String::new(),
-            candidates,
+            candidates: vec![],
+            candidates_loading: true,
             candidate_selected: None,
             dangerous: true,
             field: 0,
@@ -112,6 +115,7 @@ impl LaunchForm {
     pub fn pending_create(&self) -> Option<&str> {
         let typed = self.branch.trim();
         if typed.is_empty()
+            || self.candidates_loading // an exact match may still be on its way
             || self.candidate_selected.is_some()
             || ext::worktrunk_is_shortcut(typed)
             || self.candidates.iter().any(|c| c.branch == typed)
@@ -189,6 +193,12 @@ pub enum Pending {
         dangerous: bool,
     },
     Resume(Session),
+    /// ^d on a worktree: `wt list` decides merged vs force-confirm, and can
+    /// be slow, so it runs as a pending op instead of in the key handler.
+    DeleteWorktree {
+        path: PathBuf,
+        label: String,
+    },
     Delete(DelAction),
 }
 
@@ -210,6 +220,8 @@ pub struct App {
     preview_tx: mpsc::Sender<(String, Entry, u16, u16)>,
     preview_rx: mpsc::Receiver<(String, Text<'static>)>,
     requested: HashSet<String>,
+    // Launch-form checkout candidates load the same way (wt list can be slow).
+    candidates_rx: Option<mpsc::Receiver<(PathBuf, Vec<ext::WorktreeCandidate>)>>,
 }
 
 /// Case-insensitive subsequence match; tier order is preserved among matches
@@ -263,6 +275,7 @@ impl App {
             preview_tx,
             preview_rx,
             requested: HashSet::new(),
+            candidates_rx: None,
         };
         app.reload();
         // Every ext call swallows subprocess errors, so a missing tool would
@@ -386,6 +399,36 @@ impl App {
         }
     }
 
+    /// Open the launch form immediately and fetch its checkout candidates on
+    /// a one-off worker thread; `drain_candidates` fills them in.
+    fn open_launch_form(&mut self, dir: PathBuf) {
+        let (tx, rx) = mpsc::channel();
+        self.candidates_rx = Some(rx);
+        let d = dir.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send((d.clone(), ext::worktree_candidates(&d)));
+        });
+        self.mode = Mode::Launch(LaunchForm::new(dir, self.default_agent()));
+    }
+
+    /// Deliver finished candidate loads to the launch form (non-blocking).
+    /// Results for a form that was closed or reopened on another dir are
+    /// dropped.
+    pub fn drain_candidates(&mut self) {
+        let Some(rx) = &self.candidates_rx else {
+            return;
+        };
+        while let Ok((dir, candidates)) = rx.try_recv() {
+            if let Mode::Launch(form) = &mut self.mode
+                && form.dir == dir
+                && form.candidates_loading
+            {
+                form.candidates = candidates;
+                form.candidates_loading = false;
+            }
+        }
+    }
+
     /// Execute the queued blocking operation (see [`Pending`]).
     pub fn run_pending(&mut self) {
         let Some(pending) = self.pending.take() else {
@@ -412,6 +455,30 @@ impl App {
                 Ok(()) => self.quit = true,
                 Err(e) => self.status = Some(Status::err(e)),
             },
+            Pending::DeleteWorktree { path, label } => {
+                let Some(info) = ext::wt_info(&path) else {
+                    self.status =
+                        Some(Status::info(format!("{label} is not a worktrunk worktree")));
+                    return;
+                };
+                self.status = None;
+                let branch = if info.branch.is_empty() {
+                    label
+                } else {
+                    info.branch.clone()
+                };
+                self.mode = if info.integrated() {
+                    Mode::ConfirmDelete {
+                        msg: format!("remove merged worktree {branch}?"),
+                        action: DelAction::RemoveMerged(path),
+                    }
+                } else {
+                    Mode::ConfirmDelete {
+                        msg: format!("{branch} is not merged (state: {}).", info.main_state),
+                        action: DelAction::OfferForce(path, branch),
+                    }
+                };
+            }
             Pending::Delete(action) => {
                 let status = match action {
                     DelAction::CloseWs(id) => {
@@ -555,7 +622,7 @@ impl App {
                 self.quit = true;
             }
             EntryKind::Worktree(p) | EntryKind::Cleanable { path: p, .. } | EntryKind::Dir(p) => {
-                self.mode = Mode::Launch(LaunchForm::new(p.clone(), self.default_agent()));
+                self.open_launch_form(p.clone());
             }
             EntryKind::Session(session) => {
                 let session = session.clone();
@@ -606,29 +673,9 @@ impl App {
                 };
             }
             EntryKind::Worktree(p) => {
-                let Some(info) = ext::wt_info(p) else {
-                    self.status = Some(Status::info(format!(
-                        "{} is not a worktrunk worktree",
-                        entry.label
-                    )));
-                    return;
-                };
-                let branch = if info.branch.is_empty() {
-                    entry.label.clone()
-                } else {
-                    info.branch.clone()
-                };
-                if info.main_state == "integrated" || info.main_state == "empty" {
-                    self.mode = Mode::ConfirmDelete {
-                        msg: format!("remove merged worktree {branch}?"),
-                        action: DelAction::RemoveMerged(p.clone()),
-                    };
-                } else {
-                    self.mode = Mode::ConfirmDelete {
-                        msg: format!("{branch} is not merged (state: {}).", info.main_state),
-                        action: DelAction::OfferForce(p.clone(), branch),
-                    };
-                }
+                let (path, label) = (p.clone(), entry.label.clone());
+                self.status = Some(Status::info("checking worktree state…"));
+                self.pending = Some(Pending::DeleteWorktree { path, label });
             }
             EntryKind::Cleanable { path, clean } => {
                 if *clean {
@@ -804,10 +851,7 @@ impl App {
                     p = format!("{}/{p}", ext::home());
                 }
                 match std::fs::create_dir_all(&p) {
-                    Ok(()) => {
-                        self.mode =
-                            Mode::Launch(LaunchForm::new(PathBuf::from(p), self.default_agent()));
-                    }
+                    Ok(()) => self.open_launch_form(PathBuf::from(p)),
                     Err(e) => {
                         self.status = Some(Status::err(format!("mkdir failed: {e}")));
                         self.mode = Mode::List;
@@ -836,6 +880,7 @@ mod tests {
                     current: false,
                 })
                 .collect(),
+            candidates_loading: false,
             candidate_selected: None,
             dangerous: true,
             field: 1,
@@ -877,6 +922,11 @@ mod tests {
 
         form.branch = "  spaced  ".into();
         assert_eq!(form.pending_create(), Some("spaced"));
+
+        // While candidates are still loading, an exact match may be on its
+        // way, so no create hint.
+        form.candidates_loading = true;
+        assert_eq!(form.pending_create(), None);
     }
 
     #[test]
