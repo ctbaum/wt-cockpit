@@ -37,10 +37,12 @@ runtime, one small binary.
 ## What it does
 
 - **Browse**: live Herdr workspaces first (agents blocked on you sort to the
-  top), then worktrunk worktrees, then your zoxide directories. Type to
-  filter. The preview shows a live 2D thumbnail of each workspace's actual
-  pane layout, or worktree status (branch, merge state, dirty flags), or a
-  directory listing.
+  top), then your zoxide directories organized by project: each Git project's
+  root checkout leads, its linked worktrees follow, projects never interleave,
+  and plain directories come last. Paths inside a checkout (`project/server`)
+  are never suggested. Type to filter. The preview shows a live 2D thumbnail
+  of each workspace's actual pane layout, or worktree status (branch, merge
+  state, dirty flags), or a directory listing.
 - **Remotes**: set `HERDR_DECK_REMOTES` to a comma/space-separated list of SSH
   aliases and each remote Herdr server becomes an entry (`⇄`); Enter opens a
   `herdr --remote` thin client in its own terminal window, leaving the local

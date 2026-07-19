@@ -299,18 +299,14 @@ impl App {
                         kind: EntryKind::Remote(host),
                     });
                 }
-                let (wt, other) = ext::dirs();
-                for p in wt {
-                    self.entries.push(Entry {
-                        label: ext::collapse_tilde(&p.to_string_lossy()),
-                        kind: EntryKind::Worktree(p),
-                    });
-                }
-                for p in other {
-                    self.entries.push(Entry {
-                        label: ext::collapse_tilde(&p.to_string_lossy()),
-                        kind: EntryKind::Dir(p),
-                    });
+                for d in ext::dirs() {
+                    let label = ext::collapse_tilde(&d.path.to_string_lossy());
+                    let kind = if d.kind == ext::DirKind::Worktree {
+                        EntryKind::Worktree(d.path)
+                    } else {
+                        EntryKind::Dir(d.path)
+                    };
+                    self.entries.push(Entry { label, kind });
                 }
             }
             Source::Sessions => {

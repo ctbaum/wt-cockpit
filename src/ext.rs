@@ -165,13 +165,154 @@ pub fn open_remote(host: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// directory tiers
+// directory suggestions
 
-/// (worktrees, other dirs): zoxide frecency then fd fallback, existing dirs
-/// only, deduped; linked git worktrees floated into their own tier. A linked
-/// worktree is any dir whose `.git` is a file (`gitdir: …`) rather than a
-/// directory — no dependence on the worktree-path layout.
-pub fn dirs() -> (Vec<PathBuf>, Vec<PathBuf>) {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirKind {
+    Root,     // project root checkout (or bare-layout front dir)
+    Worktree, // linked worktree (`.git` file pointing at …/worktrees/<name>)
+    Plain,    // not a git checkout
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct ProjectDir {
+    pub path: PathBuf,
+    pub kind: DirKind,
+}
+
+/// Lexically drop `.` and resolve `..` (no fs access), so gitdir-derived
+/// group keys compare equal regardless of how the gitdir was written.
+fn normalize_path(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            c => out.push(c.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Resolve a `.git` *file* ("gitdir: …") to the repository's common git dir.
+/// Linked worktrees point at `<common>/worktrees/<name>`; a bare-layout root
+/// points straight at the store. Returns (common dir, is linked worktree).
+fn git_file_common(dir: &Path, dotgit: &Path) -> Option<(PathBuf, bool)> {
+    let text = std::fs::read_to_string(dotgit).ok()?;
+    let target = text.lines().next()?.strip_prefix("gitdir:")?.trim();
+    let target = if Path::new(target).is_absolute() {
+        PathBuf::from(target)
+    } else {
+        dir.join(target)
+    };
+    let target = normalize_path(&target);
+    let comps: Vec<_> = target.components().collect();
+    if comps.len() >= 2 && comps[comps.len() - 2].as_os_str() == "worktrees" {
+        return Some((comps[..comps.len() - 2].iter().collect(), true));
+    }
+    Some((target, false))
+}
+
+/// The checkout dir fronting a common git dir: `<root>/.git`, or a bare
+/// `<root>/.bare` / `<root>/bare` store. A detached `<name>.git` bare repo
+/// has no root checkout.
+fn root_dir_from_common(common: &Path) -> Option<PathBuf> {
+    let name = common.file_name()?.to_string_lossy();
+    if matches!(name.as_ref(), ".git" | ".bare" | "bare") {
+        common.parent().map(PathBuf::from)
+    } else {
+        None
+    }
+}
+
+/// A strict ancestor that is itself a git checkout makes `p` an in-project
+/// path (dev/project/server). $HOME and above are excluded so a git-managed
+/// home directory doesn't swallow every suggestion.
+fn inside_checkout(p: &Path) -> bool {
+    let home = PathBuf::from(home());
+    p.ancestors()
+        .skip(1)
+        .take_while(|a| **a != *home && a.parent().is_some())
+        .any(|a| a.join(".git").exists())
+}
+
+/// Group candidate dirs: git projects first, each project's root checkout
+/// leading its linked worktrees, projects in first-appearance order and never
+/// interleaved. Plain dirs follow in their original order; paths inside a
+/// checkout are dropped. A project reached only through a worktree still
+/// leads with its root when that root exists on disk.
+fn organize_dirs(candidates: Vec<PathBuf>) -> Vec<ProjectDir> {
+    struct Group {
+        root: Option<PathBuf>,
+        worktrees: Vec<PathBuf>,
+    }
+    let mut order: Vec<PathBuf> = vec![];
+    let mut groups: HashMap<PathBuf, Group> = HashMap::new();
+    let mut plain = vec![];
+    for p in candidates {
+        let dotgit = p.join(".git");
+        let (key, is_worktree) = if dotgit.is_dir() {
+            (normalize_path(&dotgit), false)
+        } else if dotgit.is_file() {
+            match git_file_common(&p, &dotgit) {
+                Some(t) => t,
+                None => {
+                    plain.push(p);
+                    continue;
+                }
+            }
+        } else if inside_checkout(&p) {
+            continue;
+        } else {
+            plain.push(p);
+            continue;
+        };
+        let group = groups.entry(key.clone()).or_insert_with(|| {
+            order.push(key);
+            Group {
+                root: None,
+                worktrees: vec![],
+            }
+        });
+        if is_worktree {
+            group.worktrees.push(p);
+        } else if group.root.is_none() {
+            group.root = Some(p);
+        }
+    }
+
+    let mut out = vec![];
+    for key in order {
+        let Some(group) = groups.remove(&key) else {
+            continue;
+        };
+        let root = group
+            .root
+            .or_else(|| root_dir_from_common(&key).filter(|r| r.is_dir()));
+        if let Some(path) = root {
+            out.push(ProjectDir {
+                path,
+                kind: DirKind::Root,
+            });
+        }
+        out.extend(group.worktrees.into_iter().map(|path| ProjectDir {
+            path,
+            kind: DirKind::Worktree,
+        }));
+    }
+    out.extend(plain.into_iter().map(|path| ProjectDir {
+        path,
+        kind: DirKind::Plain,
+    }));
+    out
+}
+
+/// Zoxide frecency then fd fallback, existing dirs only, deduped, then
+/// organized by project (see [`organize_dirs`]).
+pub fn dirs() -> Vec<ProjectDir> {
     let z = out(&["zoxide", "query", "-l"]).unwrap_or_default();
     let f = out(&[
         "fd",
@@ -187,19 +328,15 @@ pub fn dirs() -> (Vec<PathBuf>, Vec<PathBuf>) {
     ])
     .unwrap_or_default();
     let mut seen = HashSet::new();
-    let (mut wt, mut other) = (vec![], vec![]);
+    let mut candidates = vec![];
     for line in z.lines().chain(f.lines()) {
         let p = line.trim_end_matches('/');
         if p.is_empty() || !seen.insert(p.to_string()) || !Path::new(p).is_dir() {
             continue;
         }
-        if Path::new(p).join(".git").is_file() {
-            wt.push(PathBuf::from(p));
-        } else {
-            other.push(PathBuf::from(p));
-        }
+        candidates.push(PathBuf::from(p));
     }
-    (wt, other)
+    organize_dirs(candidates)
 }
 
 // ---------------------------------------------------------------------------
@@ -318,11 +455,14 @@ fn integrated_rows(value: &Value, project: &str) -> Vec<IntegratedWt> {
 /// normal directory source. Worktrunk is queried once per common git dir, so a
 /// single known checkout discovers its sibling worktrees too.
 pub fn integrated_worktrees() -> Vec<IntegratedWt> {
-    let (seeds, _) = dirs();
     let mut repositories = HashSet::new();
     let mut seen_paths = HashSet::new();
     let mut result = Vec::new();
-    for seed in seeds {
+    for seed in dirs() {
+        if seed.kind == DirKind::Plain {
+            continue;
+        }
+        let seed = seed.path;
         let Some(seed_str) = seed.to_str() else {
             continue;
         };
@@ -1158,6 +1298,118 @@ mod tests {
             project_name_from_worktrees("worktree /src/herdr-deck.git\nbare\n").as_deref(),
             Some("herdr-deck")
         );
+    }
+
+    fn fixture_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("herdr-deck-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn organizes_dirs_by_project_root_first_and_drops_in_checkout_paths() {
+        let tmp = fixture_dir("dirs");
+        let a = tmp.join("projA");
+        std::fs::create_dir_all(a.join(".git/worktrees/feat")).unwrap();
+        std::fs::create_dir_all(a.join("server")).unwrap();
+        let a_wt = tmp.join("projA.wt/feat");
+        std::fs::create_dir_all(&a_wt).unwrap();
+        std::fs::write(
+            a_wt.join(".git"),
+            format!("gitdir: {}/.git/worktrees/feat\n", a.display()),
+        )
+        .unwrap();
+        let b = tmp.join("projB");
+        std::fs::create_dir_all(b.join(".git")).unwrap();
+        let plain = tmp.join("notes");
+        std::fs::create_dir_all(&plain).unwrap();
+
+        let organized = organize_dirs(vec![
+            plain.clone(),   // frecency-first, but plain sorts after git
+            a_wt.clone(),    // project A appears first via a worktree
+            b.clone(),       // project B must not interleave into A
+            a.join("server"), // inside a checkout: dropped
+            a.clone(),       // root still leads its group
+        ]);
+        assert_eq!(
+            organized,
+            vec![
+                ProjectDir {
+                    path: a,
+                    kind: DirKind::Root
+                },
+                ProjectDir {
+                    path: a_wt,
+                    kind: DirKind::Worktree
+                },
+                ProjectDir {
+                    path: b,
+                    kind: DirKind::Root
+                },
+                ProjectDir {
+                    path: plain,
+                    kind: DirKind::Plain
+                },
+            ]
+        );
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn derives_missing_roots_and_groups_bare_layouts() {
+        let tmp = fixture_dir("dirs-bare");
+        // Root exists on disk but is not among the candidates.
+        let c = tmp.join("projC");
+        std::fs::create_dir_all(c.join(".git/worktrees/x")).unwrap();
+        let c_wt = tmp.join("projC.wt/x");
+        std::fs::create_dir_all(&c_wt).unwrap();
+        std::fs::write(
+            c_wt.join(".git"),
+            format!("gitdir: {}/.git/worktrees/x\n", c.display()),
+        )
+        .unwrap();
+        let organized = organize_dirs(vec![c_wt.clone()]);
+        assert_eq!(
+            organized,
+            vec![
+                ProjectDir {
+                    path: c.clone(),
+                    kind: DirKind::Root
+                },
+                ProjectDir {
+                    path: c_wt,
+                    kind: DirKind::Worktree
+                },
+            ]
+        );
+
+        // Bare layout: `.bare` store, root fronted by a relative gitdir file.
+        let d = tmp.join("projD");
+        std::fs::create_dir_all(d.join(".bare/worktrees/y")).unwrap();
+        std::fs::write(d.join(".git"), "gitdir: ./.bare\n").unwrap();
+        let d_wt = tmp.join("projD.wt/y");
+        std::fs::create_dir_all(&d_wt).unwrap();
+        std::fs::write(
+            d_wt.join(".git"),
+            format!("gitdir: {}/.bare/worktrees/y\n", d.display()),
+        )
+        .unwrap();
+        let organized = organize_dirs(vec![d_wt.clone(), d.clone()]);
+        assert_eq!(
+            organized,
+            vec![
+                ProjectDir {
+                    path: d,
+                    kind: DirKind::Root
+                },
+                ProjectDir {
+                    path: d_wt,
+                    kind: DirKind::Worktree
+                },
+            ]
+        );
+        std::fs::remove_dir_all(&tmp).unwrap();
     }
 
     #[test]
