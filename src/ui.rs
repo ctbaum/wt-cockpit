@@ -105,9 +105,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         }
     }
 
-    // Footer: status message wins over the key hints.
+    // Footer: status message wins over the key hints; errors in red.
     let footer_line = match &app.status {
-        Some(s) => Line::from(s.clone().yellow()),
+        Some(s) if s.error => Line::from(s.msg.clone().red()),
+        Some(s) => Line::from(s.msg.clone().yellow()),
         None if app.source == Source::Sessions => Line::from(
             " type to filter · ⇥ agent · ^s projects · ^g cleanable · ↵ resume · ^r reload · ? help · esc quit".dim(),
         ),
@@ -224,49 +225,55 @@ fn field_label(text: &str, active: bool) -> Span<'static> {
     }
 }
 
-fn draw_launch(f: &mut Frame, area: Rect, form: &LaunchForm, agents: &[String]) {
-    let check = |on: bool| if on { "[x]" } else { "[ ]" };
-    // Detected agents + "none"; selected option rendered bold.
-    let mut agent_spans = vec![field_label(" agent    ", form.field == 0)];
+/// The modal's fixed width; agent rows wrap to its inner width.
+const LAUNCH_W: u16 = 68;
+
+/// Detected agents + "none" as radio options, wrapped so a long agent list
+/// never overflows the modal; the selected option is bold and continuation
+/// rows align under the first option.
+fn agent_lines(agents: &[String], selected: usize, active: bool) -> Vec<Line<'static>> {
+    const LABEL: &str = " agent    ";
+    let max = LAUNCH_W as usize - 2;
+    let mut rows = vec![vec![field_label(LABEL, active)]];
+    let mut width = LABEL.len();
     for (i, name) in agents
         .iter()
         .map(String::as_str)
         .chain(["none"])
         .enumerate()
     {
-        let radio = format!(
-            "{} {}   ",
-            if form.agent == i { "(•)" } else { "( )" },
-            name
-        );
-        agent_spans.push(if form.agent == i {
+        let radio = format!("{} {}   ", if selected == i { "(•)" } else { "( )" }, name);
+        let w = radio.chars().count();
+        if width + w > max && width > LABEL.len() {
+            rows.push(vec![Span::raw(" ".repeat(LABEL.len()))]);
+            width = LABEL.len();
+        }
+        rows.last_mut().unwrap().push(if selected == i {
             radio.bold()
         } else {
             Span::raw(radio)
         });
+        width += w;
     }
-    let agent_width = agent_spans
-        .iter()
-        .map(|s| s.content.chars().count())
-        .sum::<usize>();
-    let mut lines = vec![
-        Line::from(agent_spans),
-        Line::from(vec![
-            field_label(" checkout ", form.field == 1),
-            form.branch.clone().yellow(),
-            if form.field == 1 {
-                "▌".yellow()
-            } else {
-                Span::raw("")
-            },
-        ]),
-    ];
+    rows.into_iter().map(Line::from).collect()
+}
+
+fn draw_launch(f: &mut Frame, area: Rect, form: &LaunchForm, agents: &[String]) {
+    let check = |on: bool| if on { "[x]" } else { "[ ]" };
+    let mut lines = agent_lines(agents, form.agent, form.field == 0);
+    lines.push(Line::from(vec![
+        field_label(" checkout ", form.field == 1),
+        form.branch.clone().yellow(),
+        if form.field == 1 {
+            "▌".yellow()
+        } else {
+            Span::raw("")
+        },
+    ]));
     if form.field == 1 {
         let matches = form.matching_candidates();
         if matches.is_empty() {
-            lines.push(Line::from(
-                "   no matching worktrees · type to create".dim(),
-            ));
+            lines.push(Line::from("   no matching worktrees".dim()));
         } else {
             let first_visible = form
                 .candidate_selected
@@ -290,6 +297,13 @@ fn draw_launch(f: &mut Frame, area: Rect, form: &LaunchForm, agents: &[String]) 
             if remaining > 0 {
                 lines.push(Line::from(format!("   … {remaining} more").dim()));
             }
+        }
+        // Enter would hand this to worktrunk as a new checkout; showing it
+        // makes a typo visible before it silently becomes a branch.
+        if let Some(name) = form.pending_create() {
+            lines.push(Line::from(
+                format!("   ↵ create worktree '{name}'").yellow(),
+            ));
         }
     }
     lines.extend([
@@ -316,8 +330,7 @@ fn draw_launch(f: &mut Frame, area: Rect, form: &LaunchForm, agents: &[String]) 
         " launch: {} ",
         ext::collapse_tilde(&form.dir.to_string_lossy())
     );
-    let w = (agent_width as u16 + 2).max(68);
-    modal(f, area, Line::from(title.green().bold()), lines, w);
+    modal(f, area, Line::from(title.green().bold()), lines, LAUNCH_W);
 }
 
 fn draw_new_path(f: &mut Frame, area: Rect, input: &str) {
@@ -404,4 +417,38 @@ fn draw_help(f: &mut Frame, area: Rect) {
     .map(|(k, v)| Line::from(vec![format!(" {k:5} ").bold(), Span::raw(v.to_string())]))
     .collect();
     modal(f, area, Line::from(" help ".green().bold()), lines, 62);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_options_wrap_within_the_modal_and_keep_every_option() {
+        let agents: Vec<String> = ["claude", "codex", "copilot", "cursor", "opencode", "droid"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let lines = agent_lines(&agents, 0, false);
+        assert!(lines.len() > 1, "six agents should wrap");
+        for line in &lines {
+            assert!(line.width() <= LAUNCH_W as usize - 2, "{}", line.width());
+        }
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(
+            text.matches("( )").count() + text.matches("(•)").count(),
+            agents.len() + 1, // + "none"
+        );
+        assert!(text.contains("(•) claude"));
+    }
+
+    #[test]
+    fn few_agents_stay_on_one_line() {
+        let lines = agent_lines(&["claude".into()], 1, true);
+        assert_eq!(lines.len(), 1);
+    }
 }

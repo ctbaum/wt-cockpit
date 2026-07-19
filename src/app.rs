@@ -105,6 +105,22 @@ impl LaunchForm {
         });
     }
 
+    /// The checkout name Enter would hand to worktrunk as a new worktree:
+    /// non-empty free-form input with no exact worktree match, no highlighted
+    /// candidate, and not a worktrunk shortcut. Shown in the form so a typo
+    /// is visible before it silently becomes a branch.
+    pub fn pending_create(&self) -> Option<&str> {
+        let typed = self.branch.trim();
+        if typed.is_empty()
+            || self.candidate_selected.is_some()
+            || ext::worktrunk_is_shortcut(typed)
+            || self.candidates.iter().any(|c| c.branch == typed)
+        {
+            return None;
+        }
+        Some(typed)
+    }
+
     fn accept_candidate(&mut self) -> bool {
         let Some(selected) = self.candidate_selected else {
             return false;
@@ -139,6 +155,43 @@ pub enum Mode {
     Help,
 }
 
+/// Footer status line. Errors render red, everything else yellow.
+pub struct Status {
+    pub msg: String,
+    pub error: bool,
+}
+
+impl Status {
+    pub fn info(msg: impl Into<String>) -> Self {
+        Self {
+            msg: msg.into(),
+            error: false,
+        }
+    }
+
+    pub fn err(msg: impl Into<String>) -> Self {
+        Self {
+            msg: msg.into(),
+            error: true,
+        }
+    }
+}
+
+/// A blocking operation queued by a key handler and executed by the event
+/// loop right after the next draw, so the status message set alongside it is
+/// on screen while subprocesses (worktrunk hooks, session scans) run.
+pub enum Pending {
+    Reload,
+    Launch {
+        dir: PathBuf,
+        agent: Option<String>,
+        branch: String,
+        dangerous: bool,
+    },
+    Resume(Session),
+    Delete(DelAction),
+}
+
 pub struct App {
     pub entries: Vec<Entry>,
     pub filter: String,
@@ -149,7 +202,8 @@ pub struct App {
     pub agents: Vec<String>, // detected agent binaries; launch form adds "none"
     pub source: Source,
     pub session_agent: Option<SessionAgent>,
-    pub status: Option<String>,
+    pub status: Option<Status>,
+    pub pending: Option<Pending>,
     pub quit: bool,
     // Previews run subprocesses (herdr/wt/eza) on a worker thread so a slow
     // or hung command can never freeze the UI; results drain each tick.
@@ -204,12 +258,25 @@ impl App {
             source: Source::Projects,
             session_agent: None,
             status: None,
+            pending: None,
             quit: false,
             preview_tx,
             preview_rx,
             requested: HashSet::new(),
         };
         app.reload();
+        // Every ext call swallows subprocess errors, so a missing tool would
+        // otherwise just look like an inexplicably empty list.
+        let missing: Vec<&str> = ["wt", "zoxide", "fd"]
+            .into_iter()
+            .filter(|bin| !ext::command_exists(bin))
+            .collect();
+        if !missing.is_empty() {
+            app.status = Some(Status::err(format!(
+                "not found: {} · related features disabled",
+                missing.join(", ")
+            )));
+        }
         app
     }
 
@@ -323,6 +390,73 @@ impl App {
         }
     }
 
+    /// Execute the queued blocking operation (see [`Pending`]).
+    pub fn run_pending(&mut self) {
+        let Some(pending) = self.pending.take() else {
+            return;
+        };
+        match pending {
+            Pending::Reload => {
+                self.reload();
+                self.status = None;
+            }
+            Pending::Launch {
+                dir,
+                agent,
+                branch,
+                dangerous,
+            } => match ext::launch_deck(&dir, agent.as_deref(), branch.trim(), dangerous) {
+                Ok(()) => self.quit = true,
+                Err(e) => {
+                    self.status = Some(Status::err(e));
+                    self.mode = Mode::List;
+                }
+            },
+            Pending::Resume(session) => match ext::launch_session_deck(&session) {
+                Ok(()) => self.quit = true,
+                Err(e) => self.status = Some(Status::err(e)),
+            },
+            Pending::Delete(action) => {
+                let status = match action {
+                    DelAction::CloseWs(id) => {
+                        ext::close_workspace(&id);
+                        Status::info("workspace closed")
+                    }
+                    DelAction::RemoveMerged(p) => {
+                        if ext::wt_remove(&p, false) {
+                            Status::info("removed merged worktree")
+                        } else {
+                            Status::err("wt remove failed (dirty tree?)")
+                        }
+                    }
+                    DelAction::ForceArmed(p, branch) => {
+                        if ext::wt_remove(&p, true) {
+                            Status::info(format!("force-removed worktree {branch}"))
+                        } else {
+                            Status::err("wt remove -f -D failed")
+                        }
+                    }
+                    DelAction::RemoveAll(paths) => {
+                        let r = ext::wt_remove_clean(&paths);
+                        let msg = format!(
+                            "removed {} · skipped {} · failed {}",
+                            r.removed, r.skipped, r.failed
+                        );
+                        if r.failed > 0 {
+                            Status::err(msg)
+                        } else {
+                            Status::info(msg)
+                        }
+                    }
+                    // Never queued: 'f' re-arms the modal instead.
+                    DelAction::OfferForce(..) => return,
+                };
+                self.reload();
+                self.status = Some(status);
+            }
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) {
         self.status = None;
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -366,7 +500,11 @@ impl App {
                 self.session_agent = None;
                 self.filter.clear();
                 self.selected = 0;
-                self.reload();
+                self.status = Some(Status::info(match self.source {
+                    Source::Sessions => "loading sessions…",
+                    _ => "loading projects…",
+                }));
+                self.pending = Some(Pending::Reload);
             }
             KeyCode::Char('g') if ctrl => {
                 self.source = if self.source == Source::Cleanup {
@@ -377,7 +515,11 @@ impl App {
                 self.session_agent = None;
                 self.filter.clear();
                 self.selected = 0;
-                self.reload();
+                self.status = Some(Status::info(match self.source {
+                    Source::Cleanup => "scanning repositories for cleanable worktrees…",
+                    _ => "loading projects…",
+                }));
+                self.pending = Some(Pending::Reload);
             }
             KeyCode::Tab if self.source == Source::Sessions => self.cycle_session_agent(1),
             KeyCode::BackTab if self.source == Source::Sessions => self.cycle_session_agent(-1),
@@ -386,7 +528,10 @@ impl App {
             KeyCode::Char('x') if ctrl && self.source == Source::Cleanup => {
                 self.confirm_remove_all()
             }
-            KeyCode::Char('r') if ctrl => self.reload(),
+            KeyCode::Char('r') if ctrl => {
+                self.status = Some(Status::info("reloading…"));
+                self.pending = Some(Pending::Reload);
+            }
             KeyCode::Char('?') if self.filter.is_empty() => self.mode = Mode::Help,
             KeyCode::Backspace => {
                 self.filter.pop();
@@ -418,10 +563,8 @@ impl App {
             }
             EntryKind::Session(session) => {
                 let session = session.clone();
-                match ext::launch_session_deck(&session) {
-                    Ok(()) => self.quit = true,
-                    Err(e) => self.status = Some(e),
-                }
+                self.pending = Some(Pending::Resume(session));
+                self.status = Some(Status::info("resuming session…"));
             }
         }
     }
@@ -468,7 +611,10 @@ impl App {
             }
             EntryKind::Worktree(p) => {
                 let Some(info) = ext::wt_info(p) else {
-                    self.status = Some(format!("{} is not a worktrunk worktree", entry.label));
+                    self.status = Some(Status::info(format!(
+                        "{} is not a worktrunk worktree",
+                        entry.label
+                    )));
                     return;
                 };
                 let branch = if info.branch.is_empty() {
@@ -495,12 +641,15 @@ impl App {
                         action: DelAction::RemoveMerged(path.clone()),
                     };
                 } else {
-                    self.status =
-                        Some("integrated, but dirty; clean the worktree before removal".into());
+                    self.status = Some(Status::info(
+                        "integrated, but dirty; clean the worktree before removal",
+                    ));
                 }
             }
             EntryKind::Dir(_) | EntryKind::Remote(_) | EntryKind::Session(_) => {
-                self.status = Some("not a workspace or worktree; nothing to delete".into());
+                self.status = Some(Status::info(
+                    "not a workspace or worktree; nothing to delete",
+                ));
             }
         }
     }
@@ -521,11 +670,11 @@ impl App {
             }
         }
         if paths.is_empty() {
-            self.status = Some(if dirty == 0 {
+            self.status = Some(Status::info(if dirty == 0 {
                 "no clean integrated worktrees in this view".into()
             } else {
                 format!("no removable worktrees; {dirty} integrated worktrees are dirty")
-            });
+            }));
             return;
         }
         let skipped = if dirty == 0 {
@@ -551,40 +700,27 @@ impl App {
         };
         match (key.code, action) {
             (KeyCode::Esc, _) => {}
-            (KeyCode::Char('y'), DelAction::CloseWs(id)) => {
-                ext::close_workspace(&id);
-                self.status = Some("workspace closed".into());
-                self.reload();
-            }
-            (KeyCode::Char('y'), DelAction::RemoveMerged(p)) => {
-                self.status = Some(if ext::wt_remove(&p, false) {
-                    "removed merged worktree".into()
-                } else {
-                    "wt remove failed (dirty tree?)".into()
-                });
-                self.reload();
-            }
-            (KeyCode::Char('y'), DelAction::RemoveAll(paths)) => {
-                let result = ext::wt_remove_clean(&paths);
-                self.status = Some(format!(
-                    "removed {} · skipped {} · failed {}",
-                    result.removed, result.skipped, result.failed
-                ));
-                self.reload();
-            }
             (KeyCode::Char('f'), DelAction::OfferForce(p, branch)) => {
                 self.mode = Mode::ConfirmDelete {
                     msg: format!("force-remove {branch}? deletes uncommitted work AND the branch"),
                     action: DelAction::ForceArmed(p, branch),
                 };
             }
-            (KeyCode::Char('y'), DelAction::ForceArmed(p, branch)) => {
-                self.status = Some(if ext::wt_remove(&p, true) {
-                    format!("force-removed worktree {branch}")
-                } else {
-                    "wt remove -f -D failed".into()
-                });
-                self.reload();
+            // Confirmed removals run as pending ops so the status below is
+            // visible while wt/herdr subprocesses do the work.
+            (
+                KeyCode::Char('y'),
+                action @ (DelAction::CloseWs(_)
+                | DelAction::RemoveMerged(_)
+                | DelAction::RemoveAll(_)
+                | DelAction::ForceArmed(..)),
+            ) => {
+                self.status = Some(Status::info(match &action {
+                    DelAction::CloseWs(_) => "closing workspace…",
+                    DelAction::RemoveAll(_) => "removing clean worktrees…",
+                    _ => "removing worktree…",
+                }));
+                self.pending = Some(Pending::Delete(action));
             }
             (_, action) => self.mode = Mode::ConfirmDelete { msg, action },
         }
@@ -614,16 +750,18 @@ impl App {
                 if form.field == 1 && form.accept_candidate() {
                     return;
                 }
-                let (dir, idx, branch) = (form.dir.clone(), form.agent, form.branch.clone());
-                let dangerous = form.dangerous;
-                let agent = self.agents.get(idx).cloned();
-                match ext::launch_deck(&dir, agent.as_deref(), branch.trim(), dangerous) {
-                    Ok(()) => self.quit = true,
-                    Err(e) => {
-                        self.status = Some(e);
-                        self.mode = Mode::List;
-                    }
-                }
+                let msg = if form.branch.trim().is_empty() {
+                    "building deck…"
+                } else {
+                    "resolving checkout, running hooks…"
+                };
+                self.pending = Some(Pending::Launch {
+                    dir: form.dir.clone(),
+                    agent: self.agents.get(form.agent).cloned(),
+                    branch: form.branch.clone(),
+                    dangerous: form.dangerous,
+                });
+                self.status = Some(Status::info(msg));
             }
             KeyCode::Left if form.field == 0 => form.agent = (form.agent + n_agents - 1) % n_agents,
             KeyCode::Right | KeyCode::Char(' ') if form.field == 0 => {
@@ -675,7 +813,7 @@ impl App {
                             Mode::Launch(LaunchForm::new(PathBuf::from(p), self.default_agent()));
                     }
                     Err(e) => {
-                        self.status = Some(format!("mkdir failed: {e}"));
+                        self.status = Some(Status::err(format!("mkdir failed: {e}")));
                         self.mode = Mode::List;
                     }
                 }
@@ -719,6 +857,30 @@ mod tests {
         assert!(form.accept_candidate());
         assert_eq!(form.branch, "feature/picker");
         assert_eq!(form.candidate_selected, None);
+    }
+
+    #[test]
+    fn create_hint_only_for_free_form_input_without_exact_match() {
+        let mut form = launch_form(&["main", "feature/picker"]);
+        assert_eq!(form.pending_create(), None); // empty input
+
+        form.branch = "pick".into(); // fuzzy match exists, but Enter creates
+        assert_eq!(form.pending_create(), Some("pick"));
+
+        form.move_candidate(1); // highlighted candidate: Enter accepts it
+        assert_eq!(form.pending_create(), None);
+        form.candidate_selected = None;
+
+        form.branch = "feature/picker".into(); // exact worktree: opens it
+        assert_eq!(form.pending_create(), None);
+
+        for shortcut in ["^", "-", "@", "pr:12"] {
+            form.branch = shortcut.into(); // worktrunk resolves these
+            assert_eq!(form.pending_create(), None, "{shortcut}");
+        }
+
+        form.branch = "  spaced  ".into();
+        assert_eq!(form.pending_create(), Some("spaced"));
     }
 
     #[test]

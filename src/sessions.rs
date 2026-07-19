@@ -2,6 +2,7 @@
 //! only while the Sessions source is active, so the normal deck search stays
 //! small and fast.
 
+use crate::ext::command_exists;
 use serde_json::Value;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
@@ -38,11 +39,6 @@ pub struct Session {
     /// Cursor exposes its saved chats through an interactive CLI picker, not a
     /// local enumerable store. This entry hands off to that native picker.
     pub native_picker: bool,
-}
-
-fn command_exists(bin: &str) -> bool {
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    std::env::split_paths(&path).any(|dir| dir.join(bin).is_file())
 }
 
 fn files(root: &Path, max_depth: usize) -> Vec<PathBuf> {

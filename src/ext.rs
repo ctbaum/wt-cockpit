@@ -19,6 +19,11 @@ pub fn json(argv: &[&str]) -> Option<Value> {
     serde_json::from_str(&out(argv)?).ok()
 }
 
+pub fn command_exists(bin: &str) -> bool {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path).any(|dir| dir.join(bin).is_file())
+}
+
 pub fn home() -> String {
     std::env::var("HOME").unwrap_or_default()
 }
@@ -353,7 +358,7 @@ struct SwitchResult {
     branch: String,
 }
 
-fn worktrunk_is_shortcut(name: &str) -> bool {
+pub fn worktrunk_is_shortcut(name: &str) -> bool {
     matches!(name, "^" | "-" | "@") || name.contains(':')
 }
 

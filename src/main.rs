@@ -43,6 +43,15 @@ fn main() -> std::io::Result<()> {
     loop {
         app.drain_previews();
         terminal.draw(|f| ui::draw(f, &mut app))?;
+        // Blocking work (worktrunk hooks, session scans, removals) runs here,
+        // right after a draw, so its status message is on screen throughout.
+        if app.pending.is_some() {
+            app.run_pending();
+            if app.quit {
+                break;
+            }
+            continue;
+        }
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
                 Event::Key(k) if k.kind == KeyEventKind::Press => app.handle_key(k),
