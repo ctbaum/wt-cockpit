@@ -1,10 +1,15 @@
 mod app;
 mod ext;
 mod preview;
+mod recent;
 mod sessions;
+mod theme;
 mod ui;
 
-use ratatui::crossterm::event::{self, DisableFocusChange, EnableFocusChange, Event, KeyEventKind};
+use ratatui::crossterm::event::{
+    self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event,
+    KeyEventKind,
+};
 use ratatui::crossterm::execute;
 use std::time::Duration;
 
@@ -31,58 +36,66 @@ fn main() -> std::io::Result<()> {
         }
         return Ok(());
     }
+    let plugin_command = match args.first().map(String::as_str) {
+        Some("--record-workspace-focus") => Some(recent::record_focus()),
+        Some("--toggle-project") => Some(recent::toggle_project()),
+        _ => None,
+    };
+    if let Some(result) = plugin_command {
+        if let Err(error) = result {
+            eprintln!("herdr-deck: {error}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     if std::env::var("HERDR_ENV").as_deref() != Ok("1") {
         eprintln!("herdr-deck: not inside a herdr session (HERDR_ENV != 1)");
         std::process::exit(1);
     }
     let mut app = app::App::new();
     let mut terminal = ratatui::init();
-    // Picker semantics: navigating away (e.g. Ctrl+hjkl pane nav) closes the
-    // picker instead of leaving a stray pane behind.
-    let _ = execute!(std::io::stdout(), EnableFocusChange);
-    loop {
-        app.drain_previews();
-        app.drain_candidates();
-        app.drain_cleanup();
-        terminal.draw(|f| ui::draw(f, &mut app))?;
-        // Blocking work (worktrunk hooks, session scans, removals) runs here,
-        // right after a draw, so its status message is on screen throughout.
-        if app.pending.is_some() {
-            app.run_pending();
+    execute!(std::io::stdout(), EnableFocusChange, EnableMouseCapture)?;
+    let result = (|| -> std::io::Result<()> {
+        loop {
+            app.drain_previews();
+            app.drain_candidates();
+            app.drain_cleanup();
+            terminal.draw(|f| ui::draw(f, &mut app))?;
+            // Blocking work runs immediately after a draw so its status is
+            // visible while worktrunk or Herdr subprocesses are active.
+            if app.pending.is_some() {
+                app.run_pending();
+                if app.quit {
+                    break;
+                }
+                continue;
+            }
+            if event::poll(Duration::from_millis(100))? {
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => app.handle_key(key),
+                    Event::Mouse(mouse) => app.handle_mouse(mouse),
+                    Event::FocusLost => app.quit = true,
+                    Event::Resize(..) => {
+                        app.invalidate_previews();
+                        app.clear_hit_regions();
+                    }
+                    _ => {}
+                }
+            } else {
+                // Idle preview requests keep subprocess cost off input events.
+                let size = terminal.size()?;
+                let (width, height) = ui::preview_dims(size.width, size.height);
+                app.request_preview(width, height);
+            }
             if app.quit {
                 break;
             }
-            continue;
         }
-        if event::poll(Duration::from_millis(100))? {
-            match event::read()? {
-                Event::Key(k) if k.kind == KeyEventKind::Press => app.handle_key(k),
-                Event::FocusLost => {
-                    // herdr quirk: the temp picker pane runs zoomed, and
-                    // focusing away can leave the zoom stuck on the newly
-                    // focused pane (hiding its siblings). Clear it on the
-                    // way out — a no-op when nothing is zoomed.
-                    ext::out(&["herdr", "pane", "zoom", "--off"]);
-                    app.quit = true;
-                }
-                Event::Resize(..) => app.invalidate_previews(),
-                _ => {}
-            }
-        } else {
-            // Idle: queue the selected entry's preview for the worker thread,
-            // so subprocess cost never lands on a keystroke (free debounce)
-            // and a hung command can't freeze input.
-            let size = terminal.size()?;
-            let (w, h) = ui::preview_dims(size.width, size.height);
-            app.request_preview(w, h);
-        }
-        if app.quit {
-            break;
-        }
-    }
-    let _ = execute!(std::io::stdout(), DisableFocusChange);
+        Ok(())
+    })();
+    let _ = execute!(std::io::stdout(), DisableMouseCapture, DisableFocusChange);
     ratatui::restore();
-    Ok(())
+    result
 }
 
 #[cfg(test)]

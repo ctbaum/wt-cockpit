@@ -11,6 +11,5 @@ cwd=$("$deck" --print-plugin-cwd)
 exec "$herdr" plugin pane open \
   --plugin "${HERDR_PLUGIN_ID:-herdr-deck}" \
   --entrypoint picker \
-  --placement zoomed \
   --cwd "$cwd" \
   --focus

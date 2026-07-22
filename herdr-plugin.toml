@@ -16,8 +16,21 @@ description = "Open or resume a Neovim workspace with a connected Claude or Code
 contexts = ["workspace"]
 command = ["bash", "scripts/open-deck.sh"]
 
+[[actions]]
+id = "toggle-project"
+title = "Toggle previous project"
+description = "Switch directly between the two most recently visited projects."
+contexts = ["workspace"]
+command = ["bash", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-deck\" --toggle-project"]
+
+[[events]]
+on = "workspace.focused"
+command = ["bash", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-deck\" --record-workspace-focus"]
+
 [[panes]]
 id = "picker"
 title = "herdr-deck"
-placement = "zoomed"
+placement = "popup"
+width = "88%"
+height = "80%"
 command = ["bash", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-deck\""]

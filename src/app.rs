@@ -3,7 +3,10 @@
 
 use crate::ext;
 use crate::sessions::{Agent as SessionAgent, Session};
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::Rect;
 use ratatui::text::Text;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -50,11 +53,56 @@ impl Entry {
     }
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Source {
     Projects,
     Sessions,
     Cleanup,
+}
+
+/// A rendered control that can receive mouse input. Rendering owns the exact
+/// rectangles so hit testing can never drift from the visible UI.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HitTarget {
+    Search,
+    Results,
+    Result(usize),
+    Source(Source),
+    CycleAgent,
+    NewPath,
+    Delete,
+    RemoveAll,
+    Reload,
+    Help,
+    Quit,
+    ModalSurface,
+    LaunchAgent(usize),
+    LaunchCheckout,
+    LaunchCandidates,
+    LaunchCandidate(usize),
+    ToggleDangerous,
+    Submit,
+    Confirm,
+    Cancel,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HitRegion {
+    pub rect: Rect,
+    pub target: HitTarget,
+}
+
+impl HitRegion {
+    pub fn new(rect: Rect, target: HitTarget) -> Self {
+        Self { rect, target }
+    }
+
+    pub(crate) fn contains(&self, column: u16, row: u16) -> bool {
+        column >= self.rect.x
+            && column < self.rect.x.saturating_add(self.rect.width)
+            && row >= self.rect.y
+            && row < self.rect.y.saturating_add(self.rect.height)
+    }
 }
 
 pub struct LaunchForm {
@@ -215,6 +263,9 @@ pub struct App {
     pub status: Option<Status>,
     pub pending: Option<Pending>,
     pub quit: bool,
+    pub palette: crate::theme::Palette,
+    pub hit_regions: Vec<HitRegion>,
+    pub hovered: Option<HitTarget>,
     // Previews run subprocesses (herdr/wt/eza) on a worker thread so a slow
     // or hung command can never freeze the UI; results drain each tick.
     preview_tx: mpsc::Sender<(String, Entry, u16, u16)>,
@@ -255,8 +306,12 @@ pub fn match_indices(hay: &str, needle: &str) -> Option<Vec<usize>> {
 
 impl App {
     pub fn new() -> Self {
-        let own_pane = ext::json(&["herdr", "pane", "current"])
-            .and_then(|v| v["result"]["pane"]["pane_id"].as_str().map(String::from))
+        // Native popups intentionally have no HERDR_PANE_ID. Using `pane
+        // current` there would identify the tiled pane underneath the popup
+        // and incorrectly remove it from workspace previews.
+        let own_pane = std::env::var("HERDR_PANE_ID")
+            .ok()
+            .filter(|pane_id| !pane_id.is_empty())
             .unwrap_or_default();
         let (preview_tx, req_rx) = mpsc::channel::<(String, Entry, u16, u16)>();
         let (res_tx, preview_rx) = mpsc::channel();
@@ -281,6 +336,9 @@ impl App {
             status: None,
             pending: None,
             quit: false,
+            palette: crate::theme::Palette::load(),
+            hit_regions: vec![],
+            hovered: None,
             preview_tx,
             preview_rx,
             requested: HashSet::new(),
@@ -569,6 +627,152 @@ impl App {
         }
     }
 
+    fn hit_target_at(&self, column: u16, row: u16) -> Option<HitTarget> {
+        self.hit_regions
+            .iter()
+            .rev()
+            .find(|region| region.contains(column, row))
+            .map(|region| region.target.clone())
+    }
+
+    pub fn clear_hit_regions(&mut self) {
+        self.hit_regions.clear();
+        self.hovered = None;
+    }
+
+    /// Mouse behavior follows Herdr's navigator: pointer movement highlights
+    /// rows, a single left-button press activates, and wheel events move by
+    /// three rows.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        let target = self.hit_target_at(mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::Moved => {
+                self.hovered.clone_from(&target);
+                match target {
+                    Some(HitTarget::Result(index)) if index < self.filtered.len() => {
+                        self.selected = index;
+                    }
+                    Some(HitTarget::LaunchCandidate(index)) => {
+                        if let Mode::Launch(form) = &mut self.mode {
+                            form.field = 1;
+                            form.candidate_selected = Some(index);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            MouseEventKind::ScrollUp => self.mouse_scroll(target.as_ref(), -3),
+            MouseEventKind::ScrollDown => self.mouse_scroll(target.as_ref(), 3),
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.status = None;
+                self.activate_hit_target(target);
+            }
+            _ => {}
+        }
+    }
+
+    fn mouse_scroll(&mut self, target: Option<&HitTarget>, delta: isize) {
+        match target {
+            Some(HitTarget::Results | HitTarget::Result(_)) if matches!(self.mode, Mode::List) => {
+                let last = self.filtered.len().saturating_sub(1);
+                self.selected = self.selected.saturating_add_signed(delta).min(last);
+            }
+            Some(HitTarget::LaunchCandidates | HitTarget::LaunchCandidate(_)) => {
+                if let Mode::Launch(form) = &mut self.mode {
+                    for _ in 0..delta.unsigned_abs() {
+                        form.move_candidate(delta.signum());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn activate_hit_target(&mut self, target: Option<HitTarget>) {
+        match target {
+            Some(HitTarget::Search | HitTarget::Results | HitTarget::LaunchCandidates) => {}
+            Some(HitTarget::Result(index)) if matches!(self.mode, Mode::List) => {
+                if index < self.filtered.len() {
+                    self.selected = index;
+                    self.open_selected();
+                }
+            }
+            Some(HitTarget::Source(source)) => self.switch_source(source),
+            Some(HitTarget::CycleAgent) if self.source == Source::Sessions => {
+                self.cycle_session_agent(1)
+            }
+            Some(HitTarget::NewPath) => self.mode = Mode::NewPath { input: "~/".into() },
+            Some(HitTarget::Delete) => self.delete_selected(),
+            Some(HitTarget::RemoveAll) => self.confirm_remove_all(),
+            Some(HitTarget::Reload) => self.queue_reload(),
+            Some(HitTarget::Help) => self.mode = Mode::Help,
+            Some(HitTarget::Quit) => self.quit = true,
+            Some(HitTarget::LaunchAgent(index)) => {
+                if let Mode::Launch(form) = &mut self.mode
+                    && index <= self.agents.len()
+                {
+                    form.agent = index;
+                    form.field = 0;
+                }
+            }
+            Some(HitTarget::LaunchCheckout) => {
+                if let Mode::Launch(form) = &mut self.mode {
+                    form.field = 1;
+                    form.candidate_selected = None;
+                }
+            }
+            Some(HitTarget::LaunchCandidate(index)) => {
+                if let Mode::Launch(form) = &mut self.mode {
+                    form.field = 1;
+                    form.candidate_selected = Some(index);
+                    form.accept_candidate();
+                }
+            }
+            Some(HitTarget::ToggleDangerous) => {
+                if let Mode::Launch(form) = &mut self.mode
+                    && self
+                        .agents
+                        .get(form.agent)
+                        .is_some_and(|agent| ext::dangerous_toggleable(agent))
+                {
+                    form.field = 2;
+                    form.dangerous = !form.dangerous;
+                }
+            }
+            Some(HitTarget::Submit) => match self.mode {
+                Mode::Launch(_) => self.submit_launch(),
+                Mode::NewPath { .. } => self.submit_new_path(),
+                _ => {}
+            },
+            Some(HitTarget::Confirm) => self.activate_confirmation(),
+            Some(HitTarget::Cancel) => self.mode = Mode::List,
+            Some(HitTarget::ModalSurface) => {}
+            None if !matches!(self.mode, Mode::List) => self.mode = Mode::List,
+            _ => {}
+        }
+    }
+
+    fn switch_source(&mut self, source: Source) {
+        if self.source == source {
+            return;
+        }
+        self.source = source;
+        self.session_agent = None;
+        self.filter.clear();
+        self.selected = 0;
+        self.status = Some(Status::info(match source {
+            Source::Projects => "loading projects…",
+            Source::Sessions => "loading sessions…",
+            Source::Cleanup => "scanning repositories for cleanable worktrees…",
+        }));
+        self.pending = Some(Pending::Reload);
+    }
+
+    fn queue_reload(&mut self) {
+        self.status = Some(Status::info("reloading…"));
+        self.pending = Some(Pending::Reload);
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) {
         self.status = None;
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -605,33 +809,19 @@ impl App {
             }
             KeyCode::Enter => self.open_selected(),
             KeyCode::Char('s') if ctrl => {
-                self.source = match self.source {
+                let source = match self.source {
                     Source::Sessions => Source::Projects,
                     Source::Projects | Source::Cleanup => Source::Sessions,
                 };
-                self.session_agent = None;
-                self.filter.clear();
-                self.selected = 0;
-                self.status = Some(Status::info(match self.source {
-                    Source::Sessions => "loading sessions…",
-                    _ => "loading projects…",
-                }));
-                self.pending = Some(Pending::Reload);
+                self.switch_source(source);
             }
             KeyCode::Char('g') if ctrl => {
-                self.source = if self.source == Source::Cleanup {
+                let source = if self.source == Source::Cleanup {
                     Source::Projects
                 } else {
                     Source::Cleanup
                 };
-                self.session_agent = None;
-                self.filter.clear();
-                self.selected = 0;
-                self.status = Some(Status::info(match self.source {
-                    Source::Cleanup => "scanning repositories for cleanable worktrees…",
-                    _ => "loading projects…",
-                }));
-                self.pending = Some(Pending::Reload);
+                self.switch_source(source);
             }
             KeyCode::Tab if self.source == Source::Sessions => self.cycle_session_agent(1),
             KeyCode::BackTab if self.source == Source::Sessions => self.cycle_session_agent(-1),
@@ -640,10 +830,7 @@ impl App {
             KeyCode::Char('x') if ctrl && self.source == Source::Cleanup => {
                 self.confirm_remove_all()
             }
-            KeyCode::Char('r') if ctrl => {
-                self.status = Some(Status::info("reloading…"));
-                self.pending = Some(Pending::Reload);
-            }
+            KeyCode::Char('r') if ctrl => self.queue_reload(),
             KeyCode::Char('?') if self.filter.is_empty() => self.mode = Mode::Help,
             KeyCode::Backspace => {
                 self.filter.pop();
@@ -791,14 +978,42 @@ impl App {
     }
 
     fn key_confirm_delete(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.mode = Mode::List,
+            KeyCode::Char('f')
+                if matches!(
+                    self.mode,
+                    Mode::ConfirmDelete {
+                        action: DelAction::OfferForce(..),
+                        ..
+                    }
+                ) =>
+            {
+                self.activate_confirmation()
+            }
+            KeyCode::Char('y')
+                if !matches!(
+                    self.mode,
+                    Mode::ConfirmDelete {
+                        action: DelAction::OfferForce(..),
+                        ..
+                    }
+                ) =>
+            {
+                self.activate_confirmation()
+            }
+            _ => {}
+        }
+    }
+
+    fn activate_confirmation(&mut self) {
         // Take the mode by value: arms either consume the action or restore it.
-        let Mode::ConfirmDelete { msg, action } = std::mem::replace(&mut self.mode, Mode::List)
+        let Mode::ConfirmDelete { action, .. } = std::mem::replace(&mut self.mode, Mode::List)
         else {
             return;
         };
-        match (key.code, action) {
-            (KeyCode::Esc, _) => {}
-            (KeyCode::Char('f'), DelAction::OfferForce(p, branch)) => {
+        match action {
+            DelAction::OfferForce(p, branch) => {
                 self.mode = Mode::ConfirmDelete {
                     msg: format!("force-remove {branch}? deletes uncommitted work AND the branch"),
                     action: DelAction::ForceArmed(p, branch),
@@ -806,13 +1021,10 @@ impl App {
             }
             // Confirmed removals run as pending ops so the status below is
             // visible while wt/herdr subprocesses do the work.
-            (
-                KeyCode::Char('y'),
-                action @ (DelAction::CloseWs(_)
-                | DelAction::RemoveMerged(_)
-                | DelAction::RemoveAll(_)
-                | DelAction::ForceArmed(..)),
-            ) => {
+            action @ (DelAction::CloseWs(_)
+            | DelAction::RemoveMerged(_)
+            | DelAction::RemoveAll(_)
+            | DelAction::ForceArmed(..)) => {
                 self.status = Some(Status::info(match &action {
                     DelAction::CloseWs(_) => "closing workspace…",
                     DelAction::RemoveAll(_) => "removing clean worktrees…",
@@ -820,7 +1032,6 @@ impl App {
                 }));
                 self.pending = Some(Pending::Delete(action));
             }
-            (_, action) => self.mode = Mode::ConfirmDelete { msg, action },
         }
     }
 
@@ -848,18 +1059,7 @@ impl App {
                 if form.field == 1 && form.accept_candidate() {
                     return;
                 }
-                let msg = if form.branch.trim().is_empty() {
-                    "building deck…"
-                } else {
-                    "resolving checkout, running hooks…"
-                };
-                self.pending = Some(Pending::Launch {
-                    dir: form.dir.clone(),
-                    agent: self.agents.get(form.agent).cloned(),
-                    branch: form.branch.clone(),
-                    dangerous: form.dangerous,
-                });
-                self.status = Some(Status::info(msg));
+                self.submit_launch();
             }
             KeyCode::Left if form.field == 0 => form.agent = (form.agent + n_agents - 1) % n_agents,
             KeyCode::Right | KeyCode::Char(' ') if form.field == 0 => {
@@ -885,6 +1085,24 @@ impl App {
         }
     }
 
+    fn submit_launch(&mut self) {
+        let Mode::Launch(form) = &self.mode else {
+            return;
+        };
+        let msg = if form.branch.trim().is_empty() {
+            "building deck…"
+        } else {
+            "resolving checkout, running hooks…"
+        };
+        self.pending = Some(Pending::Launch {
+            dir: form.dir.clone(),
+            agent: self.agents.get(form.agent).cloned(),
+            branch: form.branch.clone(),
+            dangerous: form.dangerous,
+        });
+        self.status = Some(Status::info(msg));
+    }
+
     fn key_new_path(&mut self, key: KeyEvent) {
         let Mode::NewPath { input } = &mut self.mode else {
             return;
@@ -895,25 +1113,30 @@ impl App {
                 input.pop();
             }
             KeyCode::Char(c) => input.push(c),
-            KeyCode::Enter => {
-                let raw = input.trim().to_string();
-                if raw.is_empty() {
-                    self.mode = Mode::List;
-                    return;
-                }
-                let mut p = ext::expand_tilde(&raw);
-                if !p.starts_with('/') {
-                    p = format!("{}/{p}", ext::home());
-                }
-                match std::fs::create_dir_all(&p) {
-                    Ok(()) => self.open_launch_form(PathBuf::from(p)),
-                    Err(e) => {
-                        self.status = Some(Status::err(format!("mkdir failed: {e}")));
-                        self.mode = Mode::List;
-                    }
-                }
-            }
+            KeyCode::Enter => self.submit_new_path(),
             _ => {}
+        }
+    }
+
+    fn submit_new_path(&mut self) {
+        let Mode::NewPath { input } = &self.mode else {
+            return;
+        };
+        let raw = input.trim().to_string();
+        if raw.is_empty() {
+            self.mode = Mode::List;
+            return;
+        }
+        let mut path = ext::expand_tilde(&raw);
+        if !path.starts_with('/') {
+            path = format!("{}/{path}", ext::home());
+        }
+        match std::fs::create_dir_all(&path) {
+            Ok(()) => self.open_launch_form(PathBuf::from(path)),
+            Err(error) => {
+                self.status = Some(Status::err(format!("mkdir failed: {error}")));
+                self.mode = Mode::List;
+            }
         }
     }
 }
@@ -921,6 +1144,43 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_app() -> App {
+        let (preview_tx, _preview_requests) = mpsc::channel();
+        let (_preview_results_tx, preview_rx) = mpsc::channel();
+        App {
+            entries: vec![],
+            filter: String::new(),
+            filtered: vec![],
+            selected: 0,
+            mode: Mode::List,
+            preview: HashMap::new(),
+            agents: vec!["claude".into(), "codex".into()],
+            source: Source::Projects,
+            session_agent: None,
+            status: None,
+            pending: None,
+            quit: false,
+            palette: crate::theme::Palette::terminal(),
+            hit_regions: vec![],
+            hovered: None,
+            preview_tx,
+            preview_rx,
+            requested: HashSet::new(),
+            candidates_rx: None,
+            cleanup_rx: None,
+            cleanup_loading: false,
+        }
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
 
     fn launch_form(branches: &[&str]) -> LaunchForm {
         LaunchForm {
@@ -991,5 +1251,87 @@ mod tests {
         assert_eq!(form.candidate_selected, Some(1));
         form.move_candidate(1);
         assert_eq!(form.candidate_selected, Some(0));
+    }
+
+    #[test]
+    fn mouse_hover_and_wheel_follow_visible_result_rows() {
+        let mut app = test_app();
+        app.filtered = (0..6).collect();
+        app.hit_regions = vec![
+            HitRegion::new(Rect::new(0, 0, 20, 6), HitTarget::Results),
+            HitRegion::new(Rect::new(0, 2, 20, 1), HitTarget::Result(2)),
+        ];
+
+        app.handle_mouse(mouse(MouseEventKind::Moved, 4, 2));
+        assert_eq!(app.selected, 2);
+        assert_eq!(app.hovered, Some(HitTarget::Result(2)));
+
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, 4, 2));
+        assert_eq!(app.selected, 5);
+        app.handle_mouse(mouse(MouseEventKind::ScrollUp, 4, 2));
+        assert_eq!(app.selected, 2);
+    }
+
+    #[test]
+    fn clicking_a_candidate_accepts_it_and_clicking_outside_cancels() {
+        let mut app = test_app();
+        app.mode = Mode::Launch(launch_form(&["main", "feature/picker"]));
+        app.hit_regions = vec![HitRegion::new(
+            Rect::new(3, 3, 20, 1),
+            HitTarget::LaunchCandidate(1),
+        )];
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 4, 3));
+        let Mode::Launch(form) = &app.mode else {
+            panic!("launch form should remain open");
+        };
+        assert_eq!(form.branch, "feature/picker");
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 40, 20));
+        assert!(matches!(app.mode, Mode::List));
+    }
+
+    #[test]
+    fn confirmation_click_queues_the_existing_delete_action() {
+        let mut app = test_app();
+        app.mode = Mode::ConfirmDelete {
+            msg: "close workspace?".into(),
+            action: DelAction::CloseWs("workspace-1".into()),
+        };
+        app.hit_regions = vec![HitRegion::new(Rect::new(3, 3, 12, 1), HitTarget::Confirm)];
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 4, 3));
+        assert!(matches!(
+            app.pending,
+            Some(Pending::Delete(DelAction::CloseWs(_)))
+        ));
+        assert!(matches!(app.mode, Mode::List));
+    }
+
+    #[test]
+    fn force_removal_still_requires_f_before_y_from_the_keyboard() {
+        let mut app = test_app();
+        app.mode = Mode::ConfirmDelete {
+            msg: "not merged".into(),
+            action: DelAction::OfferForce(PathBuf::from("/repo.wt/topic"), "topic".into()),
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(matches!(
+            app.mode,
+            Mode::ConfirmDelete {
+                action: DelAction::OfferForce(..),
+                ..
+            }
+        ));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        assert!(matches!(
+            app.mode,
+            Mode::ConfirmDelete {
+                action: DelAction::ForceArmed(..),
+                ..
+            }
+        ));
     }
 }

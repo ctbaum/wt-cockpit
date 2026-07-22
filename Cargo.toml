@@ -9,3 +9,4 @@ repository = "https://github.com/ctbaum/herdr-deck"
 [dependencies]
 ratatui = "0.30.2"
 serde_json = "1"
+toml = "0.9"

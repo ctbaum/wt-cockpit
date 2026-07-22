@@ -55,6 +55,9 @@ runtime, one small binary.
   Worktrunk creates or resolves the checkout, runs its lifecycle hooks, and
   returns its path to herdr-deck. The resulting deck is an editor + agent pane
   + full-width terminal + lazygit tab.
+- **Quick toggle**: the native plugin tracks workspace focus events and exposes
+  `herdr-deck.toggle-project`, which switches directly between the two most
+  recently visited projects without opening the picker.
 - **Resume**: `ctrl-s` switches to a separate session-history source, so past
   conversations never pollute workspace/path search. Type searches the first
   prompt and project path; Tab filters by agent. Claude, Codex, and Pi sessions
@@ -228,11 +231,18 @@ key = "prefix+o"
 type = "plugin_action"
 command = "herdr-deck.open"
 description = "Open herdr-deck"
+
+[[keys.command]]
+key = "alt+o"
+type = "plugin_action"
+command = "herdr-deck.toggle-project"
+description = "Toggle previous project"
 ```
 
-The plugin action uses Herdr's injected workspace context, so the temporary
-picker pane starts at the workspace root. Plugin installation requires Cargo
-because Herdr builds the Rust binary from source.
+The plugin action uses Herdr's injected workspace context, so the native popup
+starts at the workspace root. The popup occupies 88% of the terminal width and
+80% of its height. Plugin installation requires Cargo because Herdr builds the
+Rust binary from source.
 
 ### Standalone binary
 
@@ -261,8 +271,25 @@ type = "pane"
 command = "herdr-deck"
 ```
 
-Both installation modes run the same binary. herdr-deck exits when its pane
-loses focus, so the temporary pane never sticks around.
+Both installation modes run the same binary. The plugin action uses a native
+Herdr popup; a standalone invocation keeps the existing full-screen terminal
+UI. herdr-deck exits when it loses focus.
+
+## Mouse
+
+herdr-deck captures mouse input while it is open. Hover a result to preview it,
+click once to open it, and use the wheel to move through longer lists. The
+source tabs and every visible footer action are clickable. Launch forms,
+confirmation dialogs, and help expose clickable controls; clicking outside a
+dialog cancels it.
+
+The picker reads Herdr's active theme from the same config file at startup.
+Borders, selection, text, status colors, buttons, and modal surfaces follow the
+built-in palette and any `[theme.custom]` overrides. With automatic theme
+switching enabled, popups use the configured dark theme because Herdr does not
+currently expose its live host appearance to plugin processes.
+
+Keyboard controls remain available alongside the mouse:
 
 ## Keys
 
