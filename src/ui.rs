@@ -76,11 +76,14 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let results_block = panel(Line::from(" Results ".dark_gray()));
     let list_area = results_block.inner(results_area);
     f.render_widget(results_block, results_area);
-    let items: Vec<ListItem> = app
+    let mut items: Vec<ListItem> = app
         .filtered
         .iter()
         .map(|&i| ListItem::new(entry_line(&app.entries[i], &app.filter)))
         .collect();
+    if items.is_empty() && app.source == Source::Cleanup && app.cleanup_loading {
+        items.push(ListItem::new(Line::from("  scanning repositories…".dim())));
+    }
     let mut state = ListState::default().with_selected(Some(app.selected));
     f.render_stateful_widget(
         List::new(items)
@@ -109,6 +112,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let footer_line = match &app.status {
         Some(s) if s.error => Line::from(s.msg.clone().red()),
         Some(s) => Line::from(s.msg.clone().yellow()),
+        None if app.source == Source::Cleanup && app.cleanup_loading => {
+            Line::from(" scanning repositories · results appear as they are found".yellow())
+        }
         None if app.source == Source::Sessions => Line::from(
             " type to filter · ⇥ agent · ^s projects · ^g cleanable · ↵ resume · ^r reload · ? help · esc quit".dim(),
         ),

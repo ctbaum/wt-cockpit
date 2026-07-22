@@ -222,6 +222,15 @@ pub struct App {
     requested: HashSet<String>,
     // Launch-form checkout candidates load the same way (wt list can be slow).
     candidates_rx: Option<mpsc::Receiver<(PathBuf, Vec<ext::WorktreeCandidate>)>>,
+    // Cleanable worktrees stream in repository by repository from a bounded
+    // worker scan, keeping navigation responsive while the list fills.
+    cleanup_rx: Option<mpsc::Receiver<CleanupUpdate>>,
+    pub cleanup_loading: bool,
+}
+
+enum CleanupUpdate {
+    Batch(Vec<ext::IntegratedWt>),
+    Done,
 }
 
 /// Case-insensitive subsequence match; tier order is preserved among matches
@@ -276,6 +285,8 @@ impl App {
             preview_rx,
             requested: HashSet::new(),
             candidates_rx: None,
+            cleanup_rx: None,
+            cleanup_loading: false,
         };
         app.reload();
         // Every ext call swallows subprocess errors, so a missing tool would
@@ -295,6 +306,8 @@ impl App {
 
     pub fn reload(&mut self) {
         self.entries.clear();
+        self.cleanup_rx = None;
+        self.cleanup_loading = false;
         match self.source {
             Source::Projects => {
                 for w in ext::workspaces() {
@@ -330,18 +343,15 @@ impl App {
                     }));
             }
             Source::Cleanup => {
-                self.entries
-                    .extend(
-                        ext::integrated_worktrees()
-                            .into_iter()
-                            .map(|worktree| Entry {
-                                label: format!("{}/{}", worktree.project, worktree.branch),
-                                kind: EntryKind::Cleanable {
-                                    path: worktree.path,
-                                    clean: worktree.clean,
-                                },
-                            }),
-                    );
+                let (tx, rx) = mpsc::channel();
+                self.cleanup_rx = Some(rx);
+                self.cleanup_loading = true;
+                std::thread::spawn(move || {
+                    ext::scan_integrated_worktrees(|batch| {
+                        tx.send(CleanupUpdate::Batch(batch)).is_ok()
+                    });
+                    let _ = tx.send(CleanupUpdate::Done);
+                });
             }
         }
         self.invalidate_previews();
@@ -425,6 +435,45 @@ impl App {
             {
                 form.candidates = candidates;
                 form.candidates_loading = false;
+            }
+        }
+    }
+
+    /// Add finished repository scans to the cleanable list without blocking
+    /// input. Sorting each batch keeps the visible order deterministic even
+    /// though repositories finish out of order.
+    pub fn drain_cleanup(&mut self) {
+        let Some(rx) = &self.cleanup_rx else {
+            return;
+        };
+        let updates: Vec<_> = rx.try_iter().collect();
+        for update in updates {
+            match update {
+                CleanupUpdate::Batch(worktrees) => {
+                    if worktrees.is_empty() {
+                        continue;
+                    }
+                    let selected = self.selected_entry().map(Entry::cache_key);
+                    self.entries
+                        .extend(worktrees.into_iter().map(|worktree| Entry {
+                            label: format!("{}/{}", worktree.project, worktree.branch),
+                            kind: EntryKind::Cleanable {
+                                path: worktree.path,
+                                clean: worktree.clean,
+                            },
+                        }));
+                    self.entries.sort_by(|a, b| a.label.cmp(&b.label));
+                    self.apply_filter();
+                    if let Some(selected) = selected
+                        && let Some(position) = self
+                            .filtered
+                            .iter()
+                            .position(|index| self.entries[*index].cache_key() == selected)
+                    {
+                        self.selected = position;
+                    }
+                }
+                CleanupUpdate::Done => self.cleanup_loading = false,
             }
         }
     }
@@ -698,6 +747,12 @@ impl App {
     }
 
     fn confirm_remove_all(&mut self) {
+        if self.cleanup_loading {
+            self.status = Some(Status::info(
+                "wait for the repository scan to finish before removing all",
+            ));
+            return;
+        }
         let mut paths = Vec::new();
         let mut projects = HashSet::new();
         let mut dirty = 0;

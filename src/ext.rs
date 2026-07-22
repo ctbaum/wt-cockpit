@@ -6,6 +6,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub fn out(argv: &[&str]) -> Option<String> {
     let o = Command::new(argv[0]).args(&argv[1..]).output().ok()?;
@@ -451,12 +452,16 @@ fn integrated_rows(value: &Value, project: &str) -> Vec<IntegratedWt> {
         .collect()
 }
 
-/// Integrated/empty linked worktrees from every repository represented in the
-/// normal directory source. Worktrunk is queried once per common git dir, so a
-/// single known checkout discovers its sibling worktrees too.
-pub fn integrated_worktrees() -> Vec<IntegratedWt> {
+struct RepositorySeed {
+    path: PathBuf,
+    project: String,
+}
+
+/// Repositories represented in the normal directory source. Each common git
+/// dir appears once, so any checkout can discover all of its sibling
+/// worktrees without querying the same repository again.
+fn repository_seeds() -> Vec<RepositorySeed> {
     let mut repositories = HashSet::new();
-    let mut seen_paths = HashSet::new();
     let mut result = Vec::new();
     for seed in dirs() {
         if seed.kind == DirKind::Plain {
@@ -479,17 +484,56 @@ pub fn integrated_worktrees() -> Vec<IntegratedWt> {
         }
         let project = project_name_from_repo_key(&common.to_string_lossy())
             .unwrap_or_else(|| common.to_string_lossy().into_owned());
-        let Some(rows) = json(&["wt", "-C", seed_str, "list", "--format=json"]) else {
-            continue;
-        };
-        for worktree in integrated_rows(&rows, &project) {
-            if worktree.path.is_dir() && seen_paths.insert(worktree.path.clone()) {
-                result.push(worktree);
-            }
-        }
+        result.push(RepositorySeed {
+            path: seed,
+            project,
+        });
     }
-    result.sort_by(|a, b| (&a.project, &a.branch).cmp(&(&b.project, &b.branch)));
     result
+}
+
+const CLEANUP_WORKERS: usize = 4;
+
+/// Stream integrated/empty linked worktrees from every known repository.
+/// Worktrunk queries run on a small bounded set of workers because each query
+/// performs several Git operations of its own. Returning false from
+/// `on_batch` stops workers from starting more queries, which lets a dropped
+/// UI receiver cancel an obsolete scan cheaply.
+pub fn scan_integrated_worktrees<F>(on_batch: F)
+where
+    F: Fn(Vec<IntegratedWt>) -> bool + Sync,
+{
+    let repositories = repository_seeds();
+    let next = AtomicUsize::new(0);
+    let workers = CLEANUP_WORKERS.min(repositories.len());
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let on_batch = &on_batch;
+            let repositories = &repositories;
+            let next = &next;
+            scope.spawn(move || {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(repository) = repositories.get(index) else {
+                        break;
+                    };
+                    let Some(seed) = repository.path.to_str() else {
+                        continue;
+                    };
+                    let Some(rows) = json(&["wt", "-C", seed, "list", "--format=json"]) else {
+                        continue;
+                    };
+                    let worktrees = integrated_rows(&rows, &repository.project)
+                        .into_iter()
+                        .filter(|worktree| worktree.path.is_dir())
+                        .collect::<Vec<_>>();
+                    if !on_batch(worktrees) {
+                        break;
+                    }
+                }
+            });
+        }
+    });
 }
 
 #[derive(Debug, PartialEq, Eq)]
