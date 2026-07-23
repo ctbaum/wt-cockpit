@@ -1,0 +1,23 @@
+#!/bin/sh
+set -eu
+
+base=/Users/Shared/herdr-deck-demo
+
+exec env -i \
+  HOME="$base/home" \
+  USER=demo \
+  LOGNAME=demo \
+  SHELL=/bin/zsh \
+  PATH="$base/bin:/opt/homebrew/bin:/usr/bin:/bin" \
+  XDG_CONFIG_HOME="$base/home/.config" \
+  XDG_DATA_HOME="$base/home/.local/share" \
+  XDG_STATE_HOME="$base/home/.local/state" \
+  CODEX_HOME="$base/codex-home" \
+  HERDR_CONFIG_PATH="$base/config/herdr.toml" \
+  HERDR_DECK_REMOTES=render-lab \
+  HERDR_NVIM_PROMPT_MATCH='demo ➜' \
+  LANG=C.UTF-8 \
+  LC_ALL=C.UTF-8 \
+  TERM=xterm-256color \
+  COLORTERM=truecolor \
+  "$@"

@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+
+/opt/homebrew/bin/eza "$@" | sed 's/ ctl / dev /g'
