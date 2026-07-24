@@ -23,17 +23,6 @@ runtime, one small binary.
 > [Requirements and compatibility](#requirements-and-compatibility) before
 > installing.
 
-```
-╭─ herdr-deck [projects] ─╮╭──────────────────── dotfiles/main ────────────────────╮
-│> dot▌             3 / 42││ nvim                         │ codex                  │
-╰─────────────────────────╯│                              │                        │
-╭──────── Results ────────╮│                              │                        │
-│> ● dotfiles/main        ││──────────────────────────────┴────────────────────────│
-│  ● dotfiles/ratatui-ux  ││ zsh                                                   │
-│  ▸ ~/dotfiles.wt/...    ││                                                       │
-╰─────────────────────────╯╰───────────────────────────────────────────────────────╯
-```
-
 ## Demo
 
 <video src="https://github.com/user-attachments/assets/76b12347-9811-4f1f-902d-ff5972f6cb67" controls muted width="100%"></video>
