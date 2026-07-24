@@ -23,3 +23,6 @@ Thumbs.db
 # Environment / secrets
 .env
 .env.local
+
+# Showcase video lives on GitHub CDN, not in git
+artifacts/herdr-deck-showcase*.mp4

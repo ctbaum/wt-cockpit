@@ -34,6 +34,10 @@ runtime, one small binary.
 ╰─────────────────────────╯╰───────────────────────────────────────────────────────╯
 ```
 
+## Demo
+
+<video src="https://github.com/user-attachments/assets/76b12347-9811-4f1f-902d-ff5972f6cb67" controls muted width="100%"></video>
+
 ## What it does
 
 - **Browse**: live Herdr workspaces first (agents blocked on you sort to the
